@@ -161,6 +161,21 @@ It's recommended that the client always subscribes to the operations
 notification type before triggering remote operations so that it doesn't
 have to then poll for their status.
 
+# PUT vs PATCH
+The LXD API supports both PUT and PATCH to modify existing objects.
+
+PUT replaces the entire object with a new definition, it's typically
+called after the current object state was retrieved through GET.
+
+To avoid race conditions, the Etag header should be read from the GET
+response and sent as If-Match for the PUT request. This will cause LXD
+to fail the request if the object was modified between GET and PUT.
+
+PATCH can be used to modify a single field inside an object by only
+specifying the property that you want to change. To unset a key, setting
+it to empty will usually do the trick, but there are cases where PATCH
+won't work and PUT needs to be used instead.
+
 # API structure
  * /
    * /1.0
@@ -267,7 +282,7 @@ Input (replaces any existing config with the provided one):
     {
         "config": {
             "core.trust_password": "my-new-password",
-            "storage.zfs_pool_name": "lxd"
+            "core.https_address": "1.2.3.4:8443"
         }
     }
 
@@ -400,7 +415,7 @@ Input (container based on a local image with the "ubuntu/devel" alias):
         "ephemeral": true,                                                  # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                      # Config override.
         "devices": {                                                        # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -418,7 +433,7 @@ Input (container based on a local image identified by its fingerprint):
         "ephemeral": true,                                                  # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                      # Config override.
         "devices": {                                                        # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -436,7 +451,7 @@ Input (container based on most recent match based on image properties):
         "ephemeral": true,                                                  # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                      # Config override.
         "devices": {                                                        # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -458,7 +473,7 @@ Input (container without a pre-populated rootfs, useful when attaching to an exi
         "ephemeral": true,                                                  # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                      # Config override.
         "devices": {                                                        # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -475,7 +490,7 @@ Input (using a public remote image):
         "ephemeral": true,                                                  # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                      # Config override.
         "devices": {                                                        # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -497,7 +512,7 @@ Input (using a private remote image after having obtained a secret for that imag
         "ephemeral": true,                                                  # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                      # Config override.
         "devices": {                                                        # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -519,7 +534,7 @@ Input (using a remote container, sent over the migration websocket):
         "ephemeral": true,                                                              # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                                  # Config override.
         "devices": {                                                                    # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -529,6 +544,7 @@ Input (using a remote container, sent over the migration websocket):
                    "operation": "https://10.0.2.3:8443/1.0/operations/<UUID>",          # Full URL to the remote operation (pull mode only)
                    "certificate": "PEM certificate",                                    # Optional PEM certificate. If not mentioned, system CA is used.
                    "base-image": "<fingerprint>",                                       # Optional, the base image the container was created from
+                   "container_only": "true",                                            # Whether to migrate only the container without snapshots. Can be "true" or "false".
                    "secrets": {"control": "my-secret-string",                           # Secrets to use when talking to the migration source
                                "criu":    "my-other-secret",
                                "fs":      "my third secret"},
@@ -538,11 +554,17 @@ Input (using a local container):
 
     {
         "name": "my-new-container",                                                     # 64 chars max, ASCII, no slash, no colon and no comma
-        "architecture": "x86_64",
         "profiles": ["default"],                                                        # List of profiles
         "ephemeral": true,                                                              # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                                  # Config override.
+        "devices": {                                                                    # optional list of devices the container should have
+            "kvm": {
+                "path": "/dev/kvm",
+                "type": "unix-char"
+            },
+        },
         "source": {"type": "copy",                                                      # Can be: "image", "migration", "copy" or "none"
+                   "container_only": "true",                                            # Whether to copy only the container without snapshots. Can be "true" or "false".
                    "source": "my-old-container"}                                        # Name of the source container
     }
 
@@ -555,7 +577,7 @@ Input (using a remote container, in push mode sent over the migration websocket 
         "ephemeral": true,                                                              # Whether to destroy the container on shutdown
         "config": {"limits.cpu": "2"},                                                  # Config override.
         "devices": {                                                                    # optional list of devices the container should have
-            "rootfs": {
+            "kvm": {
                 "path": "/dev/kvm",
                 "type": "unix-char"
             },
@@ -564,6 +586,7 @@ Input (using a remote container, in push mode sent over the migration websocket 
                    "mode": "push",                                                      # "pull" and "push" are supported
                    "base-image": "<fingerprint>",                                       # Optional, the base image the container was created from
                    "live": true                                                         # Whether migration is performed live
+                   "container_only": "true",                                            # Whether to migrate only the container without snapshots. Can be "true" or "false".
     }
 
 ## /1.0/containers/\<name\>
@@ -815,9 +838,23 @@ The following headers may be set by the client:
  * X-LXD-uid: 0
  * X-LXD-gid: 0
  * X-LXD-mode: 0700
+ * X-LXD-type: one of "directory" or "file"
+ * X-LXD-write: overwrite (or append, introduced with API extension "file\_append")
 
 This is designed to be easily usable from the command line or even a web
 browser.
+
+### DELETE (?path=/path/inside/the/container)
+ * Description: delete a file in the container
+ * Introduced: with API extension "file\_delete"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input (none at present):
+
+    {
+    }
 
 ## /1.0/containers/\<name\>/snapshots
 ### GET
@@ -1220,6 +1257,10 @@ In the source image case, the following dict must be used:
         "properties": {                         # Image properties (optional, applied on top of source properties)
             "os": "Ubuntu"
         },
+        "aliases": [                            # Set initial aliases ("image_create_aliases" API extension)
+            {"name": "my-alias",
+             "description: "A description"
+        },
         "source": {
             "type": "image",
             "mode": "pull",                     # Only pull is supported for now
@@ -1241,6 +1282,10 @@ In the source container case, the following dict must be used:
         "properties": {                 # Image properties (optional)
             "os": "Ubuntu"
         },
+        "aliases": [                    # Set initial aliases ("image_create_aliases" API extension)
+            {"name": "my-alias",
+             "description: "A description"
+        },
         "source": {
             "type": "container",        # One of "container" or "snapshot"
             "name": "abc"
@@ -1254,6 +1299,10 @@ In the remote image URL case, the following dict must be used:
         "public":   true,                               # Whether the image can be downloaded by untrusted users  (defaults to false)
         "properties": {                                 # Image properties (optional)
             "os": "Ubuntu"
+        },
+        "aliases": [                                    # Set initial aliases ("image_create_aliases" API extension)
+            {"name": "my-alias",
+             "description: "A description"
         },
         "source": {
             "type": "url",
@@ -1818,3 +1867,310 @@ Input (none at present):
     }
 
 HTTP code for this should be 202 (Accepted).
+
+## /1.0/storage-pools
+### GET
+ * Description: list of storage pools
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: list of storage pools that are currently defined on the host
+
+    [
+        "/1.0/storage-pools/default",
+        "/1.0/storage-pools/pool1"
+        "/1.0/storage-pools/pool2"
+        "/1.0/storage-pools/pool3"
+        "/1.0/storage-pools/pool4"
+    ]
+
+### POST
+ * Description: create a new storage pool
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+    {
+        "config": {
+            "size": "10GB"
+        },
+        "driver": "zfs",
+        "name": "pool1"
+    }
+
+## /1.0/storage-pools/<name>
+### GET
+ * Description: information about a storage pool
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing a storage pool
+
+    {
+        "type": "sync",
+        "status": "Success",
+        "status_code": 200,
+        "operation": "",
+        "error_code": 0,
+        "error": "",
+        "metadata": {
+            "name": "default",
+            "driver": "zfs",
+            "used_by": [
+                "/1.0/containers/alp1",
+                "/1.0/containers/alp10",
+                "/1.0/containers/alp11",
+                "/1.0/containers/alp12",
+                "/1.0/containers/alp13",
+                "/1.0/containers/alp14",
+                "/1.0/containers/alp15",
+                "/1.0/containers/alp16",
+                "/1.0/containers/alp17",
+                "/1.0/containers/alp18",
+                "/1.0/containers/alp19",
+                "/1.0/containers/alp2",
+                "/1.0/containers/alp20",
+                "/1.0/containers/alp3",
+                "/1.0/containers/alp4",
+                "/1.0/containers/alp5",
+                "/1.0/containers/alp6",
+                "/1.0/containers/alp7",
+                "/1.0/containers/alp8",
+                "/1.0/containers/alp9",
+                "/1.0/images/62e850a334bb9d99cac00b2e618e0291e5e7bb7db56c4246ecaf8e46fa0631a6"
+            ],
+            "config": {
+                "size": "61203283968",
+                "source": "/home/chb/mnt/l2/disks/default.img",
+                "volume.size": "0",
+                "zfs.pool_name": "default"
+            }
+        }
+    }
+
+### PUT (ETag supported)
+ * Description: replace the storage pool information
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+ Input:
+
+    {
+        "config": {
+            "size": "15032385536",
+            "source": "pool1",
+            "volume.block.filesystem": "xfs",
+            "volume.block.mount_options": "discard",
+            "lvm.thinpool_name": "LXDPool",
+            "lvm.vg_name": "pool1",
+            "volume.size": "10737418240"
+        }
+    }
+
+### PATCH
+ * Description: update the storage pool configuration
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+    {
+        "config": {
+            "volume.block.filesystem": "xfs",
+        }
+    }
+
+### DELETE
+ * Description: delete a storage pool
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input (none at present):
+
+    {
+    }
+
+## /1.0/storage-pools/<name>/volumes
+### GET
+ * Description: list of storage volumes
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: list of storage volumes that currently exist on a given storage pool
+
+    [
+        "/1.0/storage-pools/default/volumes/containers/alp1",
+        "/1.0/storage-pools/default/volumes/containers/alp10",
+        "/1.0/storage-pools/default/volumes/containers/alp11",
+        "/1.0/storage-pools/default/volumes/containers/alp12",
+        "/1.0/storage-pools/default/volumes/containers/alp13",
+        "/1.0/storage-pools/default/volumes/containers/alp14",
+        "/1.0/storage-pools/default/volumes/containers/alp15",
+        "/1.0/storage-pools/default/volumes/containers/alp16",
+        "/1.0/storage-pools/default/volumes/containers/alp17",
+        "/1.0/storage-pools/default/volumes/containers/alp18",
+        "/1.0/storage-pools/default/volumes/containers/alp19",
+        "/1.0/storage-pools/default/volumes/containers/alp2",
+        "/1.0/storage-pools/default/volumes/containers/alp20",
+        "/1.0/storage-pools/default/volumes/containers/alp3",
+        "/1.0/storage-pools/default/volumes/containers/alp4",
+        "/1.0/storage-pools/default/volumes/containers/alp5",
+        "/1.0/storage-pools/default/volumes/containers/alp6",
+        "/1.0/storage-pools/default/volumes/containers/alp7",
+        "/1.0/storage-pools/default/volumes/containers/alp8",
+        "/1.0/storage-pools/default/volumes/containers/alp9",
+        "/1.0/storage-pools/default/volumes/images/62e850a334bb9d99cac00b2e618e0291e5e7bb7db56c4246ecaf8e46fa0631a6"
+    ]
+
+## /1.0/storage-pools/<pool>/volumes
+### GET
+ * Description: list all storage volumes on a storage pool
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+    {
+        "type": "sync",
+        "status": "Success",
+        "status_code": 200,
+        "error_code": 0,
+        "error": "",
+        "metadata": [
+            {
+                "type": "container",
+                "used_by": [],
+                "name": "alp1",
+                "config": {
+                "size": "0"
+                }
+            },
+            {
+                "type": "container",
+                "used_by": [],
+                "name": "alp1/snap0",
+                "config": {
+                    "size": "0"
+                }
+            },
+            {
+                "type": "image",
+                "used_by": [],
+                "name": "ade3a9bcd7ba27456673611304238c424ced1772f69d7c6b031356831d94e8ee",
+                "config": {
+                    "size": "0"
+                }
+            },
+            {
+                "type": "custom",
+                "used_by": [],
+                "name": "bla",
+                "config": {
+                    "size": "0"
+                }
+            }
+        ]
+    }
+
+
+### POST
+ * Description: create a new storage volume on a given storage pool
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+    {
+        "config": {},
+        "pool": "pool1",
+        "name": "vol1",
+        "type": "custom"
+    }
+
+
+## /1.0/storage-pools/<pool>/volumes/<type>/<name>
+### GET
+ * Description: information about a storage volume of a given type on a storage pool
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing a storage volume
+
+    {
+        "type": "sync",
+        "status": "Success",
+        "status_code": 200,
+        "error_code": 0,
+        "error": "",
+        "metadata": {
+            "type": "custom",
+            "used_by": [],
+            "name": "vol1",
+            "config": {
+                "block.filesystem": "ext4",
+                "block.mount_options": "discard",
+                "size": "10737418240"
+            }
+        }
+    }
+
+
+### PUT (ETag supported)
+ * Description: replace the storage volume information
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+ Input:
+
+    {
+        "config": {
+            "size": "15032385536",
+            "source": "pool1",
+            "used_by": "",
+            "volume.block.filesystem": "xfs",
+            "volume.block.mount_options": "discard",
+            "lvm.thinpool_name": "LXDPool",
+            "lvm.vg_name": "pool1",
+            "volume.size": "10737418240"
+        }
+    }
+
+### PATCH (ETag supported)
+ * Description: update the storage volume information
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+ Input:
+
+    {
+        "config": {
+            "volume.block.mount_options": "",
+        }
+    }
+
+### DELETE
+ * Description: delete a storage volume of a given type on a given storage pool
+ * Introduced: with API extension "storage"
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input (none at present):
+
+    {
+    }

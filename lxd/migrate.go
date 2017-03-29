@@ -27,6 +27,8 @@ import (
 type migrationFields struct {
 	live bool
 
+	containerOnly bool
+
 	controlSecret string
 	controlConn   *websocket.Conn
 	controlLock   sync.Mutex
@@ -152,8 +154,9 @@ type migrationSourceWs struct {
 	allConnected chan bool
 }
 
-func NewMigrationSource(c container) (*migrationSourceWs, error) {
+func NewMigrationSource(c container, stateful bool, containerOnly bool) (*migrationSourceWs, error) {
 	ret := migrationSourceWs{migrationFields{container: c}, make(chan bool, 1)}
+	ret.containerOnly = containerOnly
 
 	var err error
 	ret.controlSecret, err = shared.RandomCryptoString()
@@ -166,7 +169,7 @@ func NewMigrationSource(c container) (*migrationSourceWs, error) {
 		return nil, err
 	}
 
-	if c.IsRunning() {
+	if stateful && c.IsRunning() {
 		_, err := exec.LookPath("criu")
 		if err != nil {
 			return nil, fmt.Errorf("Unable to perform container live migration. CRIU isn't installed on the source server.")
@@ -211,8 +214,9 @@ func (s *migrationSourceWs) Connect(op *operation, r *http.Request, w http.Respo
 	case s.fsSecret:
 		conn = &s.fsConn
 	default:
-		/* If we didn't find the right secret, the user provided a bad one,
-		 * which 403, not 404, since this operation actually exists */
+		// If we didn't find the right secret, the user provided a bad
+		// one, which 403, not 404, since this operation actually
+		// exists.
 		return os.ErrPermission
 	}
 
@@ -243,7 +247,8 @@ fi
 	}
 	defer f.Close()
 
-	if err := f.Chmod(0500); err != nil {
+	err = f.Chmod(0500)
+	if err != nil {
 		return err
 	}
 
@@ -275,6 +280,7 @@ func snapshotToProtobuf(c container) *Snapshot {
 	isEphemeral := c.IsEphemeral()
 	arch := int32(c.Architecture())
 	stateful := c.IsStateful()
+
 	return &Snapshot{
 		Name:         &parts[len(parts)-1],
 		LocalConfig:  config,
@@ -292,46 +298,56 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 	criuType := CRIUType_CRIU_RSYNC.Enum()
 	if !s.live {
 		criuType = nil
+	}
 
-		err := s.container.StorageStart()
-		if err != nil {
-			return err
-		}
-
+	// Storage needs to start unconditionally now, since we need to
+	// initialize a new storage interface.
+	ourStart, err := s.container.StorageStart()
+	if err != nil {
+		return err
+	}
+	if ourStart {
 		defer s.container.StorageStop()
 	}
 
 	idmaps := make([]*IDMapType, 0)
 
-	idmapset := s.container.IdmapSet()
+	idmapset, err := s.container.IdmapSet()
+	if err != nil {
+		return err
+	}
+
 	if idmapset != nil {
 		for _, ctnIdmap := range idmapset.Idmap {
 			idmap := IDMapType{
 				Isuid:    proto.Bool(ctnIdmap.Isuid),
 				Isgid:    proto.Bool(ctnIdmap.Isgid),
-				Hostid:   proto.Int(ctnIdmap.Hostid),
-				Nsid:     proto.Int(ctnIdmap.Nsid),
-				Maprange: proto.Int(ctnIdmap.Maprange),
+				Hostid:   proto.Int32(int32(ctnIdmap.Hostid)),
+				Nsid:     proto.Int32(int32(ctnIdmap.Nsid)),
+				Maprange: proto.Int32(int32(ctnIdmap.Maprange)),
 			}
 
 			idmaps = append(idmaps, &idmap)
 		}
 	}
 
-	driver, fsErr := s.container.Storage().MigrationSource(s.container)
-	/* the protocol says we have to send a header no matter what, so let's
-	 * do that, but then immediately send an error.
-	 */
+	driver, fsErr := s.container.Storage().MigrationSource(s.container, s.containerOnly)
+
 	snapshots := []*Snapshot{}
 	snapshotNames := []string{}
-	if fsErr == nil {
-		fullSnaps := driver.Snapshots()
-		for _, snap := range fullSnaps {
-			snapshots = append(snapshots, snapshotToProtobuf(snap))
-			snapshotNames = append(snapshotNames, shared.ExtractSnapshotName(snap.Name()))
+	// Only send snapshots when requested.
+	if !s.containerOnly {
+		if fsErr == nil {
+			fullSnaps := driver.Snapshots()
+			for _, snap := range fullSnaps {
+				snapshots = append(snapshots, snapshotToProtobuf(snap))
+				snapshotNames = append(snapshotNames, shared.ExtractSnapshotName(snap.Name()))
+			}
 		}
 	}
 
+	// The protocol says we have to send a header no matter what, so let's
+	// do that, but then immediately send an error.
 	myType := s.container.Storage().MigrationType()
 	header := MigrationHeader{
 		Fs:            &myType,
@@ -341,7 +357,8 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		Snapshots:     snapshots,
 	}
 
-	if err := s.send(&header); err != nil {
+	err = s.send(&header)
+	if err != nil {
 		s.sendControl(err)
 		return err
 	}
@@ -351,7 +368,8 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		return fsErr
 	}
 
-	if err := s.recv(&header); err != nil {
+	err = s.recv(&header)
+	if err != nil {
 		s.sendControl(err)
 		return err
 	}
@@ -360,7 +378,7 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		myType = MigrationFSType_RSYNC
 		header.Fs = &myType
 
-		driver, _ = rsyncMigrationSource(s.container)
+		driver, _ = rsyncMigrationSource(s.container, s.containerOnly)
 	}
 
 	// All failure paths need to do a few things to correctly handle errors before returning.
@@ -376,7 +394,8 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		return err
 	}
 
-	if err := driver.SendWhileRunning(s.fsConn, migrateOp); err != nil {
+	err = driver.SendWhileRunning(s.fsConn, migrateOp)
+	if err != nil {
 		return abort(err)
 	}
 
@@ -456,7 +475,8 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 				return abort(err)
 			}
 
-			if err := writeActionScript(checkpointDir, actionScriptOp.url, actionScriptOpSecret); err != nil {
+			err = writeActionScript(checkpointDir, actionScriptOp.url, actionScriptOpSecret)
+			if err != nil {
 				os.RemoveAll(checkpointDir)
 				return abort(err)
 			}
@@ -482,7 +502,8 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 			}
 		} else {
 			defer os.RemoveAll(checkpointDir)
-			if err := s.container.Migrate(lxc.MIGRATE_DUMP, checkpointDir, "migration", true, false); err != nil {
+			err = s.container.Migrate(lxc.MIGRATE_DUMP, checkpointDir, "migration", true, false)
+			if err != nil {
 				return abort(err)
 			}
 		}
@@ -494,11 +515,13 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 		 * no reason to do these in parallel. In the future when we're using
 		 * p.haul's protocol, it will make sense to do these in parallel.
 		 */
-		if err := RsyncSend(shared.AddSlash(checkpointDir), s.criuConn, nil); err != nil {
+		err = RsyncSend(shared.AddSlash(checkpointDir), s.criuConn, nil)
+		if err != nil {
 			return abort(err)
 		}
 
-		if err := driver.SendAfterCheckpoint(s.fsConn); err != nil {
+		err = driver.SendAfterCheckpoint(s.fsConn)
+		if err != nil {
 			return abort(err)
 		}
 	}
@@ -506,7 +529,8 @@ func (s *migrationSourceWs) Do(migrateOp *operation) error {
 	driver.Cleanup()
 
 	msg := MigrationControl{}
-	if err := s.recv(&msg); err != nil {
+	err = s.recv(&msg)
+	if err != nil {
 		s.disconnect()
 		return err
 	}
@@ -541,17 +565,19 @@ type migrationSink struct {
 }
 
 type MigrationSinkArgs struct {
-	Url       string
-	Dialer    websocket.Dialer
-	Container container
-	Secrets   map[string]string
-	Push      bool
-	Live      bool
+	Url           string
+	Dialer        websocket.Dialer
+	Container     container
+	Secrets       map[string]string
+	Push          bool
+	Live          bool
+	ContainerOnly bool
 }
 
 func NewMigrationSink(args *MigrationSinkArgs) (*migrationSink, error) {
 	sink := migrationSink{
-		src:    migrationFields{container: args.Container},
+		src:    migrationFields{container: args.Container, containerOnly: args.ContainerOnly},
+		dest:   migrationFields{containerOnly: args.ContainerOnly},
 		url:    args.Url,
 		dialer: args.Dialer,
 		push:   args.Push,
@@ -745,7 +771,8 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 		resp.Fs = &myType
 	}
 
-	if err := sender(&resp); err != nil {
+	err = sender(&resp)
+	if err != nil {
 		controller(err)
 		return err
 	}
@@ -759,9 +786,9 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 			e := shared.IdmapEntry{
 				Isuid:    *idmap.Isuid,
 				Isgid:    *idmap.Isgid,
-				Nsid:     int(*idmap.Nsid),
-				Hostid:   int(*idmap.Hostid),
-				Maprange: int(*idmap.Maprange)}
+				Nsid:     int64(*idmap.Nsid),
+				Hostid:   int64(*idmap.Hostid),
+				Maprange: int64(*idmap.Maprange)}
 			srcIdmap.Idmap = shared.Extend(srcIdmap.Idmap, e)
 		}
 
@@ -796,12 +823,14 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 				fsConn = c.src.fsConn
 			}
 
-			if err := mySink(live, c.src.container, snapshots, fsConn, srcIdmap, migrateOp); err != nil {
+			err = mySink(live, c.src.container, snapshots, fsConn, srcIdmap, migrateOp, c.src.containerOnly)
+			if err != nil {
 				fsTransfer <- err
 				return
 			}
 
-			if err := ShiftIfNecessary(c.src.container, srcIdmap); err != nil {
+			err = ShiftIfNecessary(c.src.container, srcIdmap)
+			if err != nil {
 				fsTransfer <- err
 				return
 			}
@@ -825,7 +854,9 @@ func (c *migrationSink) Do(migrateOp *operation) error {
 			} else {
 				criuConn = c.src.criuConn
 			}
-			if err := RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil); err != nil {
+
+			err = RsyncRecv(shared.AddSlash(imagesDir), criuConn, nil)
+			if err != nil {
 				restore <- err
 				return
 			}

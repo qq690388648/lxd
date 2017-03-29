@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,11 +17,12 @@ import (
 
 func cmdInit() error {
 	var defaultPrivileged int // controls whether we set security.privileged=true
-	var storageBackend string // dir or zfs
-	var storageMode string    // existing, loop or device
+	var storageSetup bool     // == supportedStoragePoolDrivers
+	var storageBackend string // == supportedStoragePoolDrivers
 	var storageLoopSize int64 // Size in GB
 	var storageDevice string  // Path
 	var storagePool string    // pool name
+	var storageDataset string // existing ZFS pool name
 	var networkAddress string // Address
 	var networkPort int64     // Port
 	var trustPassword string  // Trust password
@@ -38,23 +38,27 @@ func cmdInit() error {
 	runningInUserns = shared.RunningInUserNS()
 	imagesAutoUpdate = true
 
-	// Only root should run this
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("This must be run as root")
-	}
-
 	backendsAvailable := []string{"dir"}
-	backendsSupported := []string{"dir", "zfs"}
 
-	// Detect zfs
-	out, err := exec.LookPath("zfs")
-	if err == nil && len(out) != 0 && !runningInUserns {
-		_ = loadModule("zfs")
-
-		err := shared.RunCommand("zpool", "list")
-		if err == nil {
-			backendsAvailable = append(backendsAvailable, "zfs")
+	// Check available backends
+	for _, driver := range supportedStoragePoolDrivers {
+		if driver == "dir" {
+			continue
 		}
+
+		// btrfs can work in user namespaces too. (If
+		// source=/some/path/on/btrfs is used.)
+		if runningInUserns && driver != "btrfs" {
+			continue
+		}
+
+		// Initialize a core storage interface for the given driver.
+		_, err := storageCoreInit(driver)
+		if err != nil {
+			continue
+		}
+
+		backendsAvailable = append(backendsAvailable, driver)
 	}
 
 	reader := bufio.NewReader(os.Stdin)
@@ -162,19 +166,11 @@ func cmdInit() error {
 		return fmt.Errorf("Unable to talk to LXD: %s", err)
 	}
 
-	// Check that we have no containers or images in the store
-	containers, err := c.ListContainers()
+	pools, err := c.ListStoragePools()
 	if err != nil {
-		return fmt.Errorf("Unable to list the LXD containers: %s", err)
-	}
-
-	images, err := c.ListImages()
-	if err != nil {
-		return fmt.Errorf("Unable to list the LXD images: %s", err)
-	}
-
-	if len(containers) > 0 || len(images) > 0 {
-		return fmt.Errorf("You have existing containers or images. lxd init requires an empty LXD.")
+		// We should consider this fatal since this means
+		// something's wrong with the daemon.
+		return err
 	}
 
 	if *argAuto {
@@ -183,7 +179,7 @@ func cmdInit() error {
 		}
 
 		// Do a bunch of sanity checks
-		if !shared.StringInSlice(*argStorageBackend, backendsSupported) {
+		if !shared.StringInSlice(*argStorageBackend, supportedStoragePoolDrivers) {
 			return fmt.Errorf("The requested backend '%s' isn't supported by lxd init.", *argStorageBackend)
 		}
 
@@ -192,18 +188,12 @@ func cmdInit() error {
 		}
 
 		if *argStorageBackend == "dir" {
-			if *argStorageCreateLoop != -1 || *argStorageCreateDevice != "" || *argStoragePool != "" {
+			if *argStorageCreateLoop != -1 || *argStorageCreateDevice != "" || *argStorageDataset != "" {
 				return fmt.Errorf("None of --storage-pool, --storage-create-device or --storage-create-loop may be used with the 'dir' backend.")
 			}
-		}
-
-		if *argStorageBackend == "zfs" {
+		} else {
 			if *argStorageCreateLoop != -1 && *argStorageCreateDevice != "" {
-				return fmt.Errorf("Only one of --storage-create-device or --storage-create-loop can be specified with the 'zfs' backend.")
-			}
-
-			if *argStoragePool == "" {
-				return fmt.Errorf("--storage-pool must be specified with the 'zfs' backend.")
+				return fmt.Errorf("Only one of --storage-create-device or --storage-create-loop can be specified.")
 			}
 		}
 
@@ -216,24 +206,22 @@ func cmdInit() error {
 			}
 		}
 
-		// Set the local variables
-		if *argStorageCreateDevice != "" {
-			storageMode = "device"
-		} else if *argStorageCreateLoop != -1 {
-			storageMode = "loop"
-		} else {
-			storageMode = "existing"
-		}
-
 		storageBackend = *argStorageBackend
 		storageLoopSize = *argStorageCreateLoop
 		storageDevice = *argStorageCreateDevice
-		storagePool = *argStoragePool
+		storageDataset = *argStorageDataset
 		networkAddress = *argNetworkAddress
 		networkPort = *argNetworkPort
 		trustPassword = *argTrustPassword
+		storagePool = "default"
+
+		// FIXME: Allow to configure multiple storage pools on auto init
+		// run if explicit arguments to do so are passed.
+		if len(pools) == 0 {
+			storageSetup = true
+		}
 	} else {
-		if *argStorageBackend != "" || *argStorageCreateDevice != "" || *argStorageCreateLoop != -1 || *argStoragePool != "" || *argNetworkAddress != "" || *argNetworkPort != -1 || *argTrustPassword != "" {
+		if *argStorageBackend != "" || *argStorageCreateDevice != "" || *argStorageCreateLoop != -1 || *argStorageDataset != "" || *argNetworkAddress != "" || *argNetworkPort != -1 || *argTrustPassword != "" {
 			return fmt.Errorf("Init configuration is only valid with --auto")
 		}
 
@@ -242,19 +230,35 @@ func cmdInit() error {
 			defaultStorage = "zfs"
 		}
 
-		storageBackend = askChoice(fmt.Sprintf("Name of the storage backend to use (dir or zfs) [default=%s]: ", defaultStorage), backendsSupported, defaultStorage)
+		// User chose an already existing storage pool name. Ask him
+		// again if he still wants to create one.
+	askForStorageAgain:
+		storageSetup = askBool("Do you want to configure a new storage pool (yes/no) [default=yes]? ", "yes")
+		if storageSetup {
+			storagePool = askString("Name of the new storage pool [default=default]: ", "default", nil)
+			_, err := c.StoragePoolGet(storagePool)
+			if err == nil {
+				fmt.Printf("The requested storage pool \"%s\" already exists. Please choose another name.\n", storagePool)
+				// Ask the user again if hew wants to create a
+				// storage pool.
+				goto askForStorageAgain
+			}
 
-		if !shared.StringInSlice(storageBackend, backendsSupported) {
-			return fmt.Errorf("The requested backend '%s' isn't supported by lxd init.", storageBackend)
+			storageBackend = askChoice(fmt.Sprintf("Name of the storage backend to use (%s) [default=%s]: ", strings.Join(backendsAvailable, ", "), defaultStorage), supportedStoragePoolDrivers, defaultStorage)
+
+			if !shared.StringInSlice(storageBackend, supportedStoragePoolDrivers) {
+				return fmt.Errorf("The requested backend '%s' isn't supported by lxd init.", storageBackend)
+			}
+
+			if !shared.StringInSlice(storageBackend, backendsAvailable) {
+				return fmt.Errorf("The requested backend '%s' isn't available on your system (missing tools).", storageBackend)
+			}
 		}
 
-		if !shared.StringInSlice(storageBackend, backendsAvailable) {
-			return fmt.Errorf("The requested backend '%s' isn't available on your system (missing tools).", storageBackend)
-		}
-
-		if storageBackend == "zfs" {
-			if askBool("Create a new ZFS pool (yes/no) [default=yes]? ", "yes") {
-				storagePool = askString("Name of the new ZFS pool [default=lxd]: ", "lxd", nil)
+		if storageSetup && storageBackend != "dir" {
+			storageLoopSize = -1
+			q := fmt.Sprintf("Create a new %s pool (yes/no) [default=yes]? ", strings.ToUpper(storageBackend))
+			if askBool(q, "yes") {
 				if askBool("Would you like to use an existing block device (yes/no) [default=no]? ", "no") {
 					deviceExists := func(path string) error {
 						if !shared.IsBlockdevPath(path) {
@@ -263,7 +267,6 @@ func cmdInit() error {
 						return nil
 					}
 					storageDevice = askString("Path to the existing block device: ", "", deviceExists)
-					storageMode = "device"
 				} else {
 					st := syscall.Statfs_t{}
 					err := syscall.Statfs(shared.VarPath(), &st)
@@ -280,17 +283,23 @@ func cmdInit() error {
 						def = 15
 					}
 
-					q := fmt.Sprintf("Size in GB of the new loop device (1GB minimum) [default=%d]: ", def)
+					q := fmt.Sprintf("Size in GB of the new loop device (1GB minimum) [default=%dGB]: ", def)
 					storageLoopSize = askInt(q, 1, -1, fmt.Sprintf("%d", def))
-					storageMode = "loop"
 				}
 			} else {
-				storagePool = askString("Name of the existing ZFS pool or dataset: ", "", nil)
-				storageMode = "existing"
+				q := fmt.Sprintf("Name of the existing %s pool or dataset: ", strings.ToUpper(storageBackend))
+				storageDataset = askString(q, "", nil)
 			}
 		}
 
-		if runningInUserns {
+		// Detect lack of uid/gid
+		needPrivileged := false
+		idmapset, err := shared.DefaultIdmapSet()
+		if err != nil || len(idmapset.Idmap) == 0 || idmapset.Usable() != nil {
+			needPrivileged = true
+		}
+
+		if runningInUserns && needPrivileged {
 			fmt.Printf(`
 We detected that you are running inside an unprivileged container.
 This means that unless you manually configured your host otherwise,
@@ -333,8 +342,18 @@ they otherwise would.
 			imagesAutoUpdate = false
 		}
 
+	askForNetworkAgain:
+		bridgeName = ""
 		if askBool("Would you like to create a new network bridge (yes/no) [default=yes]? ", "yes") {
 			bridgeName = askString("What should the new bridge be called [default=lxdbr0]? ", "lxdbr0", networkValidName)
+			_, err := c.NetworkGet(bridgeName)
+			if err == nil {
+				fmt.Printf("The requested network bridge \"%s\" already exists. Please choose another name.\n", bridgeName)
+				// Ask the user again if hew wants to create a
+				// storage pool.
+				goto askForNetworkAgain
+			}
+
 			bridgeIPv4 = askString("What IPv4 address should be used (CIDR subnet notation, “auto” or “none”) [default=auto]? ", "auto", func(value string) error {
 				if shared.StringInSlice(value, []string{"auto", "none"}) {
 					return nil
@@ -359,57 +378,97 @@ they otherwise would.
 		}
 	}
 
-	// Unset all storage keys, core.https_address and core.trust_password
-	for _, key := range []string{"storage.zfs_pool_name", "core.https_address", "core.trust_password"} {
-		_, err = c.SetServerConfig(key, "")
+	if storageSetup {
+		// Unset core.https_address and core.trust_password
+		for _, key := range []string{"core.https_address", "core.trust_password"} {
+			_, err = c.SetServerConfig(key, "")
+			if err != nil {
+				return err
+			}
+		}
+
+		// Pool configuration
+		storagePoolConfig := map[string]string{}
+
+		if storageDevice != "" {
+			storagePoolConfig["source"] = storageDevice
+			if storageDataset != "" {
+				storagePool = storageDataset
+			}
+		} else if storageLoopSize != -1 {
+			if storageDataset != "" {
+				storagePool = storageDataset
+			}
+		} else {
+			storagePoolConfig["source"] = storageDataset
+		}
+
+		if storageLoopSize > 0 {
+			storagePoolConfig["size"] = strconv.FormatInt(storageLoopSize, 10) + "GB"
+		}
+
+		// Create the requested storage pool.
+		err := c.StoragePoolCreate(storagePool, storageBackend, storagePoolConfig)
 		if err != nil {
 			return err
 		}
-	}
 
-	// Destroy any existing loop device
-	for _, file := range []string{"zfs.img"} {
-		os.Remove(shared.VarPath(file))
-	}
-
-	if storageBackend == "zfs" {
-		if storageMode == "loop" {
-			storageDevice = shared.VarPath("zfs.img")
-			f, err := os.Create(storageDevice)
+		// When lxd init is rerun and there are already storage pools
+		// configured, do not try to set a root disk device in the
+		// default profile again. Let the user figure this out.
+		if len(pools) == 0 {
+			// Check if there even is a default profile.
+			profiles, err := c.ListProfiles()
 			if err != nil {
-				return fmt.Errorf("Failed to open %s: %s", storageDevice, err)
+				return err
 			}
 
-			err = f.Chmod(0600)
-			if err != nil {
-				return fmt.Errorf("Failed to chmod %s: %s", storageDevice, err)
+			defaultProfileExists := false
+			for _, p := range profiles {
+				if p.Name != "default" {
+					continue
+				}
+
+				defaultProfileExists = true
+
+				foundRootDiskDevice := false
+				for k, v := range p.Devices {
+					if v["path"] == "/" && v["source"] == "" {
+						foundRootDiskDevice = true
+
+						// Unconditionally overwrite because if the user ends up
+						// with a clean LXD but with a pool property key existing in
+						// the default profile it must be empty otherwise it would
+						// not have been possible to delete the storage pool in
+						// the first place.
+						p.ProfilePut.Devices[k]["pool"] = storagePool
+
+						// Update profile devices.
+						err := c.PutProfile("default", p.ProfilePut)
+						if err != nil {
+							return err
+						}
+						shared.LogDebugf("Set pool property of existing root disk device \"%s\" in profile \"default\" to \"%s\".", storagePool)
+
+						break
+					}
+				}
+
+				if foundRootDiskDevice {
+					break
+				}
+
+				props := []string{"path=/", fmt.Sprintf("pool=%s", storagePool)}
+				_, err = c.ProfileDeviceAdd("default", "root", "disk", props)
+				if err != nil {
+					return err
+				}
+				break
 			}
 
-			err = f.Truncate(int64(storageLoopSize * 1024 * 1024 * 1024))
-			if err != nil {
-				return fmt.Errorf("Failed to create sparse file %s: %s", storageDevice, err)
+			if !defaultProfileExists {
+				shared.LogWarnf("Did not find profile \"default\" so no default storage pool will be set. Manual intervention needed.")
 			}
-
-			err = f.Close()
-			if err != nil {
-				return fmt.Errorf("Failed to close %s: %s", storageDevice, err)
-			}
-		}
-
-		if shared.StringInSlice(storageMode, []string{"loop", "device"}) {
-			output, err := exec.Command(
-				"zpool",
-				"create", storagePool, storageDevice,
-				"-f", "-m", "none", "-O", "compression=on").CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("Failed to create the ZFS pool: %s", output)
-			}
-		}
-
-		// Configure LXD to use the pool
-		_, err = c.SetServerConfig("storage.zfs_pool_name", storagePool)
-		if err != nil {
-			return err
 		}
 	}
 

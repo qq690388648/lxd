@@ -34,20 +34,28 @@ func (c *fileCmd) showByDefault() bool {
 
 func (c *fileCmd) usage() string {
 	return i18n.G(
-		`Manage files in a container.
+		`Usage: lxc file <subcommand> [options]
 
-lxc file pull [-r|--recursive] [<remote>:]<container> [[<remote>:]<container>...] <target path>
-lxc file push [-r|--recursive] [-p|--create-dirs] [--uid=UID] [--gid=GID] [--mode=MODE] <source path> [<source path>...] [<remote>:]<container>
+Manage files in containers.
+
+lxc file pull [-r|--recursive] [<remote>:]<container>/<path> [[<remote>:]<container>/<path>...] <target path>
+    Pull files from containers.
+
+lxc file push [-r|--recursive] [-p|--create-dirs] [--uid=UID] [--gid=GID] [--mode=MODE] <source path> [<source path>...] [<remote>:]<container>/<path>
+    Push files into containers.
+
+lxc file delete [<remote>:]<container>/<path> [[<remote>:]<container>/<path>...]
+    Delete files in containers.
+
 lxc file edit [<remote>:]<container>/<path>
+    Edit files in containers using the default text editor.
 
-<source> in the case of pull, <target> in the case of push and <file> in the case of edit are <container name>/<path>
+*Examples*
+lxc file push /etc/hosts foo/etc/hosts
+   To push /etc/hosts into the container "foo".
 
-Examples:
-To push /etc/hosts into the container foo:
-    lxc file push /etc/hosts foo/etc/hosts
-
-To pull /etc/hosts from the container:
-    lxc file pull foo/etc/hosts .`)
+lxc file pull foo/etc/hosts .
+   To pull /etc/hosts from the container and write it to the current directory.`)
 }
 
 func (c *fileCmd) flags() {
@@ -340,6 +348,32 @@ func (c *fileCmd) pull(config *lxd.Config, args []string) error {
 	return nil
 }
 
+func (c *fileCmd) delete(config *lxd.Config, args []string) error {
+	if len(args) < 1 {
+		return errArgs
+	}
+
+	for _, f := range args[:] {
+		pathSpec := strings.SplitN(f, "/", 2)
+		if len(pathSpec) != 2 {
+			return fmt.Errorf(i18n.G("Invalid path %s"), f)
+		}
+
+		remote, container := config.ParseRemoteAndContainer(pathSpec[0])
+		d, err := lxd.NewClient(config, remote)
+		if err != nil {
+			return err
+		}
+
+		err = d.DeleteFile(container, pathSpec[1])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (c *fileCmd) edit(config *lxd.Config, args []string) error {
 	if len(args) != 1 {
 		return errArgs
@@ -382,7 +416,7 @@ func (c *fileCmd) edit(config *lxd.Config, args []string) error {
 
 func (c *fileCmd) run(config *lxd.Config, args []string) error {
 	if len(args) < 1 {
-		return errArgs
+		return errUsage
 	}
 
 	switch args[0] {
@@ -390,6 +424,8 @@ func (c *fileCmd) run(config *lxd.Config, args []string) error {
 		return c.push(config, true, args[1:])
 	case "pull":
 		return c.pull(config, args[1:])
+	case "delete":
+		return c.delete(config, args[1:])
 	case "edit":
 		return c.edit(config, args[1:])
 	default:

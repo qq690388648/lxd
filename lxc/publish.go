@@ -25,9 +25,9 @@ func (c *publishCmd) showByDefault() bool {
 
 func (c *publishCmd) usage() string {
 	return i18n.G(
-		`Publish containers as images.
+		`Usage: lxc publish [<remote>:]<container>[/<snapshot>] [<remote>:] [--alias=ALIAS...] [prop-key=prop-value...]
 
-lxc publish [<remote>:]<container>[/<snapshot>] [<remote>:] [--alias=ALIAS...] [prop-key=prop-value...]`)
+Publish containers as images.`)
 }
 
 func (c *publishCmd) flags() {
@@ -113,7 +113,15 @@ func (c *publishCmd) run(config *lxd.Config, args []string) error {
 			if op.StatusCode == api.Failure {
 				return fmt.Errorf(i18n.G("Stopping container failed!"))
 			}
-			defer s.Action(cName, shared.Start, -1, true, false)
+
+			defer func() {
+				resp, err := s.Action(cName, shared.Start, -1, true, false)
+				if err != nil {
+					return
+				}
+
+				s.WaitFor(resp.Operation)
+			}()
 
 			if wasEphemeral {
 				ct.Ephemeral = true

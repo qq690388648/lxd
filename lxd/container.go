@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -106,6 +107,8 @@ func containerValidDeviceConfigKey(t, k string) bool {
 			return true
 		case "parent":
 			return true
+		case "vlan":
+			return true
 		case "ipv4.address":
 			return true
 		case "ipv6.address":
@@ -134,6 +137,8 @@ func containerValidDeviceConfigKey(t, k string) bool {
 		case "source":
 			return true
 		case "recursive":
+			return true
+		case "pool":
 			return true
 		default:
 			return false
@@ -203,7 +208,7 @@ func containerValidConfig(d *Daemon, config map[string]string, profile bool, exp
 
 	_, rawSeccomp := config["raw.seccomp"]
 	_, whitelist := config["security.syscalls.whitelist"]
-	_, blacklist := config["securtiy.syscalls.blacklist"]
+	_, blacklist := config["security.syscalls.blacklist"]
 	blacklistDefault := shared.IsTrue(config["security.syscalls.blacklist_default"])
 	blacklistCompat := shared.IsTrue(config["security.syscalls.blacklist_compat"])
 
@@ -215,7 +220,41 @@ func containerValidConfig(d *Daemon, config map[string]string, profile bool, exp
 		return fmt.Errorf("security.syscalls.whitelist is mutually exclusive with security.syscalls.blacklist*")
 	}
 
+	if expanded && (config["security.privileged"] == "" || !shared.IsTrue(config["security.privileged"])) && d.IdmapSet == nil {
+		return fmt.Errorf("LXD doesn't have a uid/gid allocation. In this mode, only privileged containers are supported.")
+	}
+
 	return nil
+}
+
+func isRootDiskDevice(device types.Device) bool {
+	if device["type"] == "disk" && device["path"] == "/" && device["source"] == "" {
+		return true
+	}
+
+	return false
+}
+
+func containerGetRootDiskDevice(devices types.Devices) (string, types.Device, error) {
+	var devName string
+	var dev types.Device
+
+	for n, d := range devices {
+		if isRootDiskDevice(d) {
+			if devName != "" {
+				return "", types.Device{}, fmt.Errorf("More than one root device found.")
+			}
+
+			devName = n
+			dev = d
+		}
+	}
+
+	if devName != "" {
+		return devName, dev, nil
+	}
+
+	return "", types.Device{}, fmt.Errorf("No root device could be found.")
 }
 
 func containerValidDevices(devices types.Devices, profile bool, expanded bool) error {
@@ -224,6 +263,7 @@ func containerValidDevices(devices types.Devices, profile bool, expanded bool) e
 		return nil
 	}
 
+	var diskDevicePaths []string
 	// Check each device individually
 	for name, m := range devices {
 		if m["type"] == "" {
@@ -253,6 +293,12 @@ func containerValidDevices(devices types.Devices, profile bool, expanded bool) e
 				return fmt.Errorf("Missing parent for %s type nic.", m["nictype"])
 			}
 		} else if m["type"] == "disk" {
+			if !expanded && !shared.StringInSlice(m["path"], diskDevicePaths) {
+				diskDevicePaths = append(diskDevicePaths, m["path"])
+			} else if !expanded {
+				return fmt.Errorf("More than one disk device uses the same path: %s.", m["path"])
+			}
+
 			if m["path"] == "" {
 				return fmt.Errorf("Disk entry is missing the required \"path\" property.")
 			}
@@ -272,9 +318,38 @@ func containerValidDevices(devices types.Devices, profile bool, expanded bool) e
 			if (m["path"] == "/" || !shared.IsDir(m["source"])) && m["recursive"] != "" {
 				return fmt.Errorf("The recursive option is only supported for additional bind-mounted paths.")
 			}
+
+			if m["pool"] != "" {
+				if storageValidName(m["pool"]) != nil {
+					return fmt.Errorf("The specified storage pool name is not valid.")
+				}
+				if filepath.IsAbs(m["source"]) {
+					return fmt.Errorf("Storage volumes cannot be specified as absolute paths.")
+				}
+			}
+
 		} else if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
 			if m["path"] == "" {
 				return fmt.Errorf("Unix device entry is missing the required \"path\" property.")
+			}
+
+			if m["major"] == "" || m["minor"] == "" {
+				if !shared.PathExists(m["path"]) {
+					return fmt.Errorf("The device path doesn't exist on the host and major/minor wasn't specified.")
+				}
+
+				dType, _, _, err := deviceGetAttributes(m["path"])
+				if err != nil {
+					return err
+				}
+
+				if m["type"] == "unix-char" && dType != "c" {
+					return fmt.Errorf("Path specified for unix-char device is a block device.")
+				}
+
+				if m["type"] == "unix-block" && dType != "b" {
+					return fmt.Errorf("Path specified for unix-block device is a character device.")
+				}
 			}
 		} else if m["type"] == "usb" {
 			if m["vendorid"] == "" {
@@ -292,15 +367,9 @@ func containerValidDevices(devices types.Devices, profile bool, expanded bool) e
 
 	// Checks on the expanded config
 	if expanded {
-		foundRootfs := false
-		for _, m := range devices {
-			if m["type"] == "disk" && m["path"] == "/" {
-				foundRootfs = true
-			}
-		}
-
-		if !foundRootfs {
-			return fmt.Errorf("Container is lacking rootfs entry")
+		_, _, err := containerGetRootDiskDevice(devices)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -356,8 +425,8 @@ type container interface {
 
 	// File handling
 	FileExists(path string) error
-	FilePull(srcpath string, dstpath string) (int, int, os.FileMode, string, []string, error)
-	FilePush(srcpath string, dstpath string, uid int, gid int, mode int) error
+	FilePull(srcpath string, dstpath string) (int64, int64, os.FileMode, string, []string, error)
+	FilePush(srcpath string, dstpath string, uid int64, gid int64, mode int, write string) error
 	FileRemove(path string) error
 
 	/* Command execution:
@@ -372,7 +441,7 @@ type container interface {
 	         *      (the PID returned in the first return argument). It can however
 	         *      be used to e.g. forward signals.)
 	*/
-	Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, wait bool) (int, int, error)
+	Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, wait bool) (*exec.Cmd, int, int, error)
 
 	// Status
 	Render() (interface{}, interface{}, error)
@@ -411,11 +480,14 @@ type container interface {
 	LogFilePath() string
 	LogPath() string
 
+	StoragePool() (string, error)
+
 	// FIXME: Those should be internal functions
-	StorageStart() error
-	StorageStop() error
+	// Needed for migration for now.
+	StorageStart() (bool, error)
+	StorageStop() (bool, error)
 	Storage() storage
-	IdmapSet() *shared.IdmapSet
+	IdmapSet() (*shared.IdmapSet, error)
 	LastIdmapSet() (*shared.IdmapSet, error)
 	TemplateApply(trigger string) error
 	Daemon() *Daemon
@@ -475,6 +547,9 @@ func containerCreateFromImage(d *Daemon, args containerArgs, hash string) (conta
 		}
 	}
 
+	// Set the BaseImage field (regardless of previous value)
+	args.BaseImage = hash
+
 	// Create the container
 	c, err := containerCreateInternal(d, args)
 	if err != nil {
@@ -501,27 +576,69 @@ func containerCreateFromImage(d *Daemon, args containerArgs, hash string) (conta
 	return c, nil
 }
 
-func containerCreateAsCopy(d *Daemon, args containerArgs, sourceContainer container) (container, error) {
-	// Create the container
-	c, err := containerCreateInternal(d, args)
+func containerCreateAsCopy(d *Daemon, args containerArgs, sourceContainer container, containerOnly bool) (container, error) {
+	// Create the container.
+	ct, err := containerCreateInternal(d, args)
 	if err != nil {
 		return nil, err
 	}
 
-	// Now clone the storage
-	if err := c.Storage().ContainerCopy(c, sourceContainer); err != nil {
-		c.Delete()
+	csList := []*container{}
+	if !containerOnly {
+		snapshots, err := sourceContainer.Snapshots()
+		if err != nil {
+			return nil, err
+		}
+
+		csList = make([]*container, len(snapshots))
+		for i, snap := range snapshots {
+			fields := strings.SplitN(snap.Name(), shared.SnapshotDelimiter, 2)
+			newSnapName := fmt.Sprintf("%s/%s", ct.Name(), fields[1])
+			csArgs := containerArgs{
+				Architecture: snap.Architecture(),
+				Config:       snap.LocalConfig(),
+				Ctype:        cTypeSnapshot,
+				Devices:      snap.LocalDevices(),
+				Ephemeral:    snap.IsEphemeral(),
+				Name:         newSnapName,
+				Profiles:     snap.Profiles(),
+			}
+
+			// Create the snapshots.
+			cs, err := containerCreateInternal(d, csArgs)
+			if err != nil {
+				return nil, err
+			}
+
+			csList[i] = &cs
+		}
+	}
+
+	// Now clone the storage.
+	if err := ct.Storage().ContainerCopy(ct, sourceContainer, containerOnly); err != nil {
+		ct.Delete()
 		return nil, err
 	}
 
-	// Apply any post-storage configuration
-	err = containerConfigureInternal(c)
+	// Apply any post-storage configuration.
+	err = containerConfigureInternal(ct)
 	if err != nil {
-		c.Delete()
+		ct.Delete()
 		return nil, err
 	}
 
-	return c, nil
+	if !containerOnly {
+		for _, cs := range csList {
+			// Apply any post-storage configuration.
+			err = containerConfigureInternal(*cs)
+			if err != nil {
+				(*cs).Delete()
+				return nil, err
+			}
+		}
+	}
+
+	return ct, nil
 }
 
 func containerCreateAsSnapshot(d *Daemon, args containerArgs, sourceContainer container) (container, error) {
@@ -569,6 +686,14 @@ func containerCreateAsSnapshot(d *Daemon, args containerArgs, sourceContainer co
 	if err := sourceContainer.Storage().ContainerSnapshotCreate(c, sourceContainer); err != nil {
 		c.Delete()
 		return nil, err
+	}
+
+	ourStart, err := c.StorageStart()
+	if err != nil {
+		return nil, err
+	}
+	if ourStart {
+		defer c.StorageStop()
 	}
 
 	err = writeBackupFile(sourceContainer)
@@ -633,6 +758,10 @@ func containerCreateInternal(d *Daemon, args containerArgs) (container, error) {
 		return nil, err
 	}
 
+	if !shared.IntInSlice(args.Architecture, d.architectures) {
+		return nil, fmt.Errorf("Requested architecture isn't supported by this host")
+	}
+
 	// Validate profiles
 	profiles, err := dbProfiles(d.db)
 	if err != nil {
@@ -671,6 +800,7 @@ func containerCreateInternal(d *Daemon, args containerArgs) (container, error) {
 	args.CreationDate = dbArgs.CreationDate
 	args.LastUsedDate = dbArgs.LastUsedDate
 
+	// Setup the container struct and finish creation (storage and idmap)
 	c, err := containerLXCCreate(d, args)
 	if err != nil {
 		return nil, err
@@ -681,25 +811,33 @@ func containerCreateInternal(d *Daemon, args containerArgs) (container, error) {
 
 func containerConfigureInternal(c container) error {
 	// Find the root device
-	for _, m := range c.ExpandedDevices() {
-		if m["type"] != "disk" || m["path"] != "/" || m["size"] == "" {
-			continue
-		}
+	_, rootDiskDevice, err := containerGetRootDiskDevice(c.ExpandedDevices())
+	if err != nil {
+		return err
+	}
 
-		size, err := shared.ParseByteSizeString(m["size"])
+	if rootDiskDevice["size"] != "" {
+		size, err := shared.ParseByteSizeString(rootDiskDevice["size"])
 		if err != nil {
 			return err
 		}
 
+		// Storage is guaranteed to be ready.
 		err = c.Storage().ContainerSetQuota(c, size)
 		if err != nil {
 			return err
 		}
-
-		break
 	}
 
-	err := writeBackupFile(c)
+	ourStart, err := c.StorageStart()
+	if err != nil {
+		return err
+	}
+	if ourStart {
+		defer c.StorageStop()
+	}
+
+	err = writeBackupFile(c)
 	if err != nil {
 		return err
 	}

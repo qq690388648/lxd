@@ -64,7 +64,7 @@ func containerSnapshotsGet(d *Daemon, r *http.Request) Response {
 func nextSnapshot(d *Daemon, name string) int {
 	base := name + shared.SnapshotDelimiter + "snap"
 	length := len(base)
-	q := fmt.Sprintf("SELECT MAX(name) FROM containers WHERE type=? AND SUBSTR(name,1,?)=?")
+	q := fmt.Sprintf("SELECT name FROM containers WHERE type=? AND SUBSTR(name,1,?)=?")
 	var numstr string
 	inargs := []interface{}{cTypeSnapshot, length, base}
 	outfmt := []interface{}{numstr}
@@ -105,6 +105,14 @@ func containerSnapshotsPost(d *Daemon, r *http.Request) Response {
 	c, err := containerLoadByName(d, name)
 	if err != nil {
 		return SmartError(err)
+	}
+
+	ourStart, err := c.StorageStart()
+	if err != nil {
+		return InternalError(err)
+	}
+	if ourStart {
+		defer c.StorageStop()
 	}
 
 	req := api.ContainerSnapshotsPost{}
@@ -196,7 +204,7 @@ func snapshotPost(d *Daemon, r *http.Request, sc container, containerName string
 
 	migration, err := raw.GetBool("migration")
 	if err == nil && migration {
-		ws, err := NewMigrationSource(sc)
+		ws, err := NewMigrationSource(sc, false, true)
 		if err != nil {
 			return SmartError(err)
 		}

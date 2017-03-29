@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -68,6 +67,7 @@ var dbUpdates = []dbUpdate{
 	{version: 32, run: dbUpdateFromV31},
 	{version: 33, run: dbUpdateFromV32},
 	{version: 34, run: dbUpdateFromV33},
+	{version: 35, run: dbUpdateFromV34},
 }
 
 type dbUpdate struct {
@@ -124,6 +124,42 @@ func dbUpdatesApplyAll(d *Daemon) error {
 }
 
 // Schema updates begin here
+func dbUpdateFromV34(currentVersion int, version int, d *Daemon) error {
+	stmt := `
+CREATE TABLE IF NOT EXISTS storage_pools (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    driver VARCHAR(255) NOT NULL,
+    UNIQUE (name)
+);
+CREATE TABLE IF NOT EXISTS storage_pools_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    storage_pool_id INTEGER NOT NULL,
+    key VARCHAR(255) NOT NULL,
+    value TEXT,
+    UNIQUE (storage_pool_id, key),
+    FOREIGN KEY (storage_pool_id) REFERENCES storage_pools (id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS storage_volumes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    storage_pool_id INTEGER NOT NULL,
+    type INTEGER NOT NULL,
+    UNIQUE (storage_pool_id, name, type),
+    FOREIGN KEY (storage_pool_id) REFERENCES storage_pools (id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS storage_volumes_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    storage_volume_id INTEGER NOT NULL,
+    key VARCHAR(255) NOT NULL,
+    value TEXT,
+    UNIQUE (storage_volume_id, key),
+    FOREIGN KEY (storage_volume_id) REFERENCES storage_volumes (id) ON DELETE CASCADE
+);`
+	_, err := d.db.Exec(stmt)
+	return err
+}
+
 func dbUpdateFromV33(currentVersion int, version int, d *Daemon) error {
 	stmt := `
 CREATE TABLE IF NOT EXISTS networks (
@@ -444,9 +480,9 @@ func dbUpdateFromV15(currentVersion int, version int, d *Daemon) error {
 
 		shared.LogDebug("About to rename cName in lv upgrade", log.Ctx{"lvLinkPath": lvLinkPath, "cName": cName, "newLVName": newLVName})
 
-		output, err := exec.Command("lvrename", vgName, cName, newLVName).CombinedOutput()
+		output, err := shared.RunCommand("lvrename", vgName, cName, newLVName)
 		if err != nil {
-			return fmt.Errorf("Could not rename LV '%s' to '%s': %v\noutput:%s", cName, newLVName, err, string(output))
+			return fmt.Errorf("Could not rename LV '%s' to '%s': %v\noutput:%s", cName, newLVName, err, output)
 		}
 
 		if err := os.Remove(lvLinkPath); err != nil {
@@ -537,7 +573,7 @@ func dbUpdateFromV11(currentVersion int, version int, d *Daemon) error {
 
 			// Rsync
 			// containers/<container>/snapshots/<snap0>
-			//   to
+			// to
 			// snapshots/<container>/<snap0>
 			output, err := storageRsyncCopy(oldPath, newPath)
 			if err != nil {

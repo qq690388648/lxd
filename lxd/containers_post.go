@@ -48,8 +48,8 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 
 		var image *api.Image
 
-		for _, hash := range hashes {
-			_, img, err := dbImageGet(d.db, hash, false, true)
+		for _, imageHash := range hashes {
+			_, img, err := dbImageGet(d.db, imageHash, false, true)
 			if err != nil {
 				continue
 			}
@@ -83,10 +83,19 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 	}
 
 	run := func(op *operation) error {
+		args := containerArgs{
+			Config:    req.Config,
+			Ctype:     cTypeRegular,
+			Devices:   req.Devices,
+			Ephemeral: req.Ephemeral,
+			Name:      req.Name,
+			Profiles:  req.Profiles,
+		}
+
 		if req.Source.Server != "" {
 			hash, err = d.ImageDownload(
 				op, req.Source.Server, req.Source.Protocol, req.Source.Certificate, req.Source.Secret,
-				hash, true, daemonConfig["images.auto_update_cached"].GetBool())
+				hash, true, daemonConfig["images.auto_update_cached"].GetBool(), "")
 			if err != nil {
 				return err
 			}
@@ -97,25 +106,12 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 			return err
 		}
 
-		hash = imgInfo.Fingerprint
-
-		architecture, err := osarch.ArchitectureId(imgInfo.Architecture)
+		args.Architecture, err = osarch.ArchitectureId(imgInfo.Architecture)
 		if err != nil {
-			architecture = 0
+			return err
 		}
 
-		args := containerArgs{
-			Architecture: architecture,
-			BaseImage:    hash,
-			Config:       req.Config,
-			Ctype:        cTypeRegular,
-			Devices:      req.Devices,
-			Ephemeral:    req.Ephemeral,
-			Name:         req.Name,
-			Profiles:     req.Profiles,
-		}
-
-		_, err = containerCreateFromImage(d, args, hash)
+		_, err = containerCreateFromImage(d, args, imgInfo.Fingerprint)
 		return err
 	}
 
@@ -131,19 +127,21 @@ func createFromImage(d *Daemon, req *api.ContainersPost) Response {
 }
 
 func createFromNone(d *Daemon, req *api.ContainersPost) Response {
-	architecture, err := osarch.ArchitectureId(req.Architecture)
-	if err != nil {
-		architecture = 0
+	args := containerArgs{
+		Config:    req.Config,
+		Ctype:     cTypeRegular,
+		Devices:   req.Devices,
+		Ephemeral: req.Ephemeral,
+		Name:      req.Name,
+		Profiles:  req.Profiles,
 	}
 
-	args := containerArgs{
-		Architecture: architecture,
-		Config:       req.Config,
-		Ctype:        cTypeRegular,
-		Devices:      req.Devices,
-		Ephemeral:    req.Ephemeral,
-		Name:         req.Name,
-		Profiles:     req.Profiles,
+	if req.Architecture != "" {
+		architecture, err := osarch.ArchitectureId(req.Architecture)
+		if err != nil {
+			return InternalError(err)
+		}
+		args.Architecture = architecture
 	}
 
 	run := func(op *operation) error {
@@ -163,15 +161,20 @@ func createFromNone(d *Daemon, req *api.ContainersPost) Response {
 }
 
 func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
+	// Validate migration mode
 	if req.Source.Mode != "pull" && req.Source.Mode != "push" {
 		return NotImplemented
 	}
 
+	var c container
+
+	// Parse the architecture name
 	architecture, err := osarch.ArchitectureId(req.Architecture)
 	if err != nil {
-		architecture = 0
+		return BadRequest(err)
 	}
 
+	// Prepare the container creation request
 	args := containerArgs{
 		Architecture: architecture,
 		BaseImage:    req.Source.BaseImage,
@@ -183,8 +186,89 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		Profiles:     req.Profiles,
 	}
 
-	var c container
-	_, _, err = dbImageGet(d.db, req.Source.BaseImage, false, true)
+	// Grab the container's root device if one is specified
+	storagePool := ""
+	storagePoolProfile := ""
+
+	localRootDiskDeviceKey, localRootDiskDevice, _ := containerGetRootDiskDevice(req.Devices)
+	if localRootDiskDeviceKey != "" {
+		storagePool = localRootDiskDevice["pool"]
+	}
+
+	// Handle copying/moving between two storage-api LXD instances.
+	if storagePool != "" {
+		_, err := dbStoragePoolGetID(d.db, storagePool)
+		if err == NoSuchObjectError {
+			storagePool = ""
+			// Unset the local root disk device storage pool if not
+			// found.
+			localRootDiskDevice["pool"] = ""
+		}
+	}
+
+	// If we don't have a valid pool yet, look through profiles
+	if storagePool == "" {
+		for _, pName := range req.Profiles {
+			_, p, err := dbProfileGet(d.db, pName)
+			if err != nil {
+				return InternalError(err)
+			}
+
+			k, v, _ := containerGetRootDiskDevice(p.Devices)
+			if k != "" && v["pool"] != "" {
+				// Keep going as we want the last one in the profile chain
+				storagePool = v["pool"]
+				storagePoolProfile = pName
+			}
+		}
+	}
+
+	shared.LogDebugf("No valid storage pool in the container's local root disk device and profiles found.")
+	// If there is just a single pool in the database, use that
+	if storagePool == "" {
+		pools, err := dbStoragePools(d.db)
+		if err != nil {
+			if err == NoSuchObjectError {
+				return BadRequest(fmt.Errorf("This LXD instance does not have any storage pools configured."))
+			}
+			return InternalError(err)
+		}
+
+		if len(pools) == 1 {
+			storagePool = pools[0]
+		}
+	}
+
+	if storagePool == "" {
+		return BadRequest(fmt.Errorf("Can't find a storage pool for the container to use"))
+	}
+
+	if localRootDiskDeviceKey == "" && storagePoolProfile == "" {
+		// Give the container it's own local root disk device with a
+		// pool property.
+		rootDev := map[string]string{}
+		rootDev["type"] = "disk"
+		rootDev["path"] = "/"
+		rootDev["pool"] = storagePool
+		if args.Devices == nil {
+			args.Devices = map[string]map[string]string{}
+		}
+
+		// Make sure that we do not overwrite a device the user
+		// is currently using under the name "root".
+		rootDevName := "root"
+		for i := 0; i < 100; i++ {
+			if args.Devices[rootDevName] == nil {
+				break
+			}
+			rootDevName = fmt.Sprintf("root%d", i)
+			continue
+		}
+
+		args.Devices["root"] = rootDev
+	} else if localRootDiskDeviceKey != "" && localRootDiskDevice["pool"] == "" {
+		args.Devices[localRootDiskDeviceKey]["pool"] = storagePool
+	}
 
 	/* Only create a container from an image if we're going to
 	 * rsync over the top of it. In the case of a better file
@@ -199,15 +283,45 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 	 * point and just negotiate it over the migration control
 	 * socket. Anyway, it'll happen later :)
 	 */
-	if err == nil && d.Storage.MigrationType() == MigrationFSType_RSYNC {
-		c, err = containerCreateFromImage(d, args, req.Source.BaseImage)
+	_, _, err = dbImageGet(d.db, req.Source.BaseImage, false, true)
+	if err != nil {
+		c, err = containerCreateAsEmpty(d, args)
 		if err != nil {
 			return InternalError(err)
 		}
 	} else {
-		c, err = containerCreateAsEmpty(d, args)
+		// Retrieve the future storage pool
+		cM, err := containerLXCLoad(d, args)
 		if err != nil {
 			return InternalError(err)
+		}
+
+		_, rootDiskDevice, err := containerGetRootDiskDevice(cM.ExpandedDevices())
+		if err != nil {
+			return InternalError(err)
+		}
+
+		if rootDiskDevice["pool"] == "" {
+			return BadRequest(fmt.Errorf("The container's root device is missing the pool property."))
+		}
+
+		storagePool = rootDiskDevice["pool"]
+
+		ps, err := storagePoolInit(d, storagePool)
+		if err != nil {
+			return InternalError(err)
+		}
+
+		if ps.MigrationType() == MigrationFSType_RSYNC {
+			c, err = containerCreateFromImage(d, args, req.Source.BaseImage)
+			if err != nil {
+				return InternalError(err)
+			}
+		} else {
+			c, err = containerCreateAsEmpty(d, args)
+			if err != nil {
+				return InternalError(err)
+			}
 		}
 	}
 
@@ -242,10 +356,11 @@ func createFromMigration(d *Daemon, req *api.ContainersPost) Response {
 		Dialer: websocket.Dialer{
 			TLSClientConfig: config,
 			NetDial:         shared.RFC3493Dialer},
-		Container: c,
-		Secrets:   req.Source.Websockets,
-		Push:      push,
-		Live:      req.Source.Live,
+		Container:     c,
+		Secrets:       req.Source.Websockets,
+		Push:          push,
+		Live:          req.Source.Live,
+		ContainerOnly: req.Source.ContainerOnly,
 	}
 
 	sink, err := NewMigrationSink(&migrationArgs)
@@ -323,6 +438,22 @@ func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
 		req.Config[key] = value
 	}
 
+	// Devices override
+	sourceDevices := source.LocalDevices()
+
+	if req.Devices == nil {
+		req.Devices = make(map[string]map[string]string)
+	}
+
+	for key, value := range sourceDevices {
+		_, exists := req.Devices[key]
+		if exists {
+			continue
+		}
+
+		req.Devices[key] = value
+	}
+
 	// Profiles override
 	if req.Profiles == nil {
 		req.Profiles = source.Profiles()
@@ -333,18 +464,17 @@ func createFromCopy(d *Daemon, req *api.ContainersPost) Response {
 		BaseImage:    req.Source.BaseImage,
 		Config:       req.Config,
 		Ctype:        cTypeRegular,
-		Devices:      source.LocalDevices(),
+		Devices:      req.Devices,
 		Ephemeral:    req.Ephemeral,
 		Name:         req.Name,
 		Profiles:     req.Profiles,
 	}
 
 	run := func(op *operation) error {
-		_, err := containerCreateAsCopy(d, args, source)
+		_, err := containerCreateAsCopy(d, args, source, req.Source.ContainerOnly)
 		if err != nil {
 			return err
 		}
-
 		return nil
 	}
 
@@ -365,6 +495,12 @@ func containersPost(d *Daemon, r *http.Request) Response {
 	req := api.ContainersPost{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BadRequest(err)
+	}
+
+	// If no storage pool is found, error out.
+	pools, err := dbStoragePools(d.db)
+	if err != nil || len(pools) == 0 {
+		return BadRequest(fmt.Errorf("No storage pool found. Please create a new storage pool."))
 	}
 
 	if req.Name == "" {

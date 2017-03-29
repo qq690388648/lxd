@@ -21,40 +21,6 @@ import (
 	"github.com/lxc/lxd/shared/termios"
 )
 
-type SortImage [][]string
-
-func (a SortImage) Len() int {
-	return len(a)
-}
-
-func (a SortImage) Swap(i, j int) {
-	a[i], a[j] = a[j], a[i]
-}
-
-func (a SortImage) Less(i, j int) bool {
-	if a[i][0] == a[j][0] {
-		if a[i][3] == "" {
-			return false
-		}
-
-		if a[j][3] == "" {
-			return true
-		}
-
-		return a[i][3] < a[j][3]
-	}
-
-	if a[i][0] == "" {
-		return false
-	}
-
-	if a[j][0] == "" {
-		return true
-	}
-
-	return a[i][0] < a[j][0]
-}
-
 type aliasList []string
 
 func (f *aliasList) String() string {
@@ -94,7 +60,9 @@ func (c *imageCmd) imageEditHelp() string {
 
 func (c *imageCmd) usage() string {
 	return i18n.G(
-		`Manipulate container images.
+		`Usage: lxc image <subcommand> [options]
+
+Manipulate container images.
 
 In LXD containers are created from images. Those images were themselves
 either generated from an existing container or downloaded from an image
@@ -240,7 +208,7 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 	var remote string
 
 	if len(args) < 1 {
-		return errArgs
+		return errUsage
 	}
 
 	switch args[0] {
@@ -281,6 +249,7 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 		if err == nil {
 			progress.Done(i18n.G("Image copied successfully!"))
 		}
+		progress.Done("")
 
 		return err
 
@@ -367,7 +336,11 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 		}
 		fmt.Println(i18n.G("Aliases:"))
 		for _, alias := range info.Aliases {
-			fmt.Printf("    - %s\n", alias.Name)
+			if alias.Description != "" {
+				fmt.Printf("    - %s (%s)\n", alias.Name, alias.Description)
+			} else {
+				fmt.Printf("    - %s\n", alias.Name)
+			}
 		}
 		fmt.Printf(i18n.G("Auto update: %s")+"\n", autoUpdate)
 		if info.UpdateSource != nil {

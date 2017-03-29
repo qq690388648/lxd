@@ -227,7 +227,7 @@ func dbImageGet(db *sql.DB, fingerprint string, public bool, strictMatching bool
 	aliases := []api.ImageAlias{}
 	for _, r := range results {
 		name = r[0].(string)
-		desc = r[0].(string)
+		desc = r[1].(string)
 		a := api.ImageAlias{Name: name, Description: desc}
 		aliases = append(aliases, a)
 	}
@@ -243,14 +243,8 @@ func dbImageGet(db *sql.DB, fingerprint string, public bool, strictMatching bool
 }
 
 func dbImageDelete(db *sql.DB, id int) error {
-	tx, err := dbBegin(db)
+	_, err := dbExec(db, "DELETE FROM images WHERE id=?", id)
 	if err != nil {
-		return err
-	}
-
-	_, _ = tx.Exec("DELETE FROM images WHERE id=?", id)
-
-	if err := txCommit(tx); err != nil {
 		return err
 	}
 
@@ -453,4 +447,47 @@ func dbImageInsert(db *sql.DB, fp string, fname string, sz int64, public bool, a
 	}
 
 	return nil
+}
+
+// Get the names of all storage pools on which a given image exists.
+func dbImageGetPools(db *sql.DB, imageFingerprint string) ([]int64, error) {
+	poolID := int64(-1)
+	query := "SELECT storage_pool_id FROM storage_volumes WHERE name=? AND type=?"
+	inargs := []interface{}{imageFingerprint, storagePoolVolumeTypeImage}
+	outargs := []interface{}{poolID}
+
+	result, err := dbQueryScan(db, query, inargs, outargs)
+	if err != nil {
+		return []int64{}, err
+	}
+
+	poolIDs := []int64{}
+	for _, r := range result {
+		poolIDs = append(poolIDs, r[0].(int64))
+	}
+
+	return poolIDs, nil
+}
+
+// Get the names of all storage pools on which a given image exists.
+func dbImageGetPoolNamesFromIDs(db *sql.DB, poolIDs []int64) ([]string, error) {
+	var poolName string
+	query := "SELECT name FROM storage_pools WHERE id=?"
+
+	poolNames := []string{}
+	for _, poolID := range poolIDs {
+		inargs := []interface{}{poolID}
+		outargs := []interface{}{poolName}
+
+		result, err := dbQueryScan(db, query, inargs, outargs)
+		if err != nil {
+			return []string{}, err
+		}
+
+		for _, r := range result {
+			poolNames = append(poolNames, r[0].(string))
+		}
+	}
+
+	return poolNames, nil
 }

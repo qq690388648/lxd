@@ -24,24 +24,12 @@ func dbContainerRemove(db *sql.DB, name string) error {
 		return err
 	}
 
-	tx, err := dbBegin(db)
+	_, err = dbExec(db, "DELETE FROM containers WHERE id=?", id)
 	if err != nil {
 		return err
 	}
 
-	err = dbContainerConfigClear(tx, id)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	_, err = tx.Exec("DELETE FROM containers WHERE id=?", id)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	return txCommit(tx)
+	return nil
 }
 
 func dbContainerName(db *sql.DB, id int) (string, error) {
@@ -451,4 +439,28 @@ func dbContainerGetSnapshots(db *sql.DB, name string) ([]string, error) {
 	}
 
 	return result, nil
+}
+
+// Get the storage pool of a given container.
+func dbContainerPool(db *sql.DB, containerName string) (string, error) {
+	// Get container storage volume. Since container names are globally
+	// unique, and their storage volumes carry the same name, their storage
+	// volumes are unique too.
+	poolName := ""
+	query := `SELECT storage_pools.name FROM storage_pools
+JOIN storage_volumes ON storage_pools.id=storage_volumes.storage_pool_id
+WHERE storage_volumes.name=? AND storage_volumes.type=?`
+	inargs := []interface{}{containerName, storagePoolVolumeTypeContainer}
+	outargs := []interface{}{&poolName}
+
+	err := dbQueryRowScan(db, query, inargs, outargs)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", NoSuchObjectError
+		}
+
+		return "", err
+	}
+
+	return poolName, nil
 }

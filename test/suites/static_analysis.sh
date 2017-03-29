@@ -10,8 +10,8 @@ test_static_analysis() {
 
     cd ../
     # Python3 static analysis
-    pep8 test/deps/import-busybox scripts/lxd-setup-lvm-storage
-    pyflakes3 test/deps/import-busybox scripts/lxd-setup-lvm-storage
+    pep8 test/deps/import-busybox
+    pyflakes3 test/deps/import-busybox
 
     # Shell static analysis
     shellcheck test/main.sh test/suites/* test/backends/*
@@ -25,9 +25,7 @@ test_static_analysis() {
     fi
 
     ## go vet, if it exists
-    have_go_vet=1
-    go help vet > /dev/null 2>&1 || have_go_vet=0
-    if [ "${have_go_vet}" -eq 1 ]; then
+    if go help vet >/dev/null 2>&1; then
       go vet ./...
     fi
 
@@ -36,15 +34,18 @@ test_static_analysis() {
       vet --all .
     fi
 
+    ## golint
+    if which golint >/dev/null 2>&1; then
+      golint -set_exit_status shared/api/
+    fi
+
     ## deadcode
     if which deadcode >/dev/null 2>&1; then
-      for path in . fuidshift lxc lxd lxd/types shared shared/api shared/i18n shared/ioprogress shared/logging shared/osarch shared/simplestreams shared/termios shared/version test/lxd-benchmark; do
-        OUT=$(deadcode ./${path} 2>&1 | grep -v lxd/migrate.pb.go: | grep -v /C: | grep -vi _cgo | grep -vi _cfunc || true)
-        if [ -n "${OUT}" ]; then
-          echo "${OUT}" >&2
-          false
-        fi
-      done
+      OUT=$(deadcode ./ ./fuidshift ./lxc ./lxd ./lxd/types ./shared ./shared/api ./shared/i18n ./shared/ioprogress ./shared/logging ./shared/osarch ./shared/simplestreams ./shared/termios ./shared/version ./test/lxd-benchmark 2>&1 | grep -v lxd/migrate.pb.go: | grep -v /C: | grep -vi _cgo | grep -vi _cfunc || true)
+      if [ -n "${OUT}" ]; then
+        echo "${OUT}" >&2
+        false
+      fi
     fi
 
     if which godeps >/dev/null 2>&1; then
@@ -62,7 +63,7 @@ test_static_analysis() {
 
     # go fmt
     git add -u :/
-    go fmt ./...
+    gofmt -w -s ./
     git diff --exit-code
 
     # make sure the .pot is updated

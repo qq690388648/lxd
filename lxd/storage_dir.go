@@ -3,76 +3,300 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/gorilla/websocket"
 
 	"github.com/lxc/lxd/shared"
-
-	log "gopkg.in/inconshreveable/log15.v2"
+	"github.com/lxc/lxd/shared/api"
 )
 
 type storageDir struct {
-	d *Daemon
-
 	storageShared
 }
 
-func (s *storageDir) Init(config map[string]interface{}) (storage, error) {
+// Only initialize the minimal information we need about a given storage type.
+func (s *storageDir) StorageCoreInit() error {
 	s.sType = storageTypeDir
-	s.sTypeName = storageTypeToString(s.sType)
-	if err := s.initShared(); err != nil {
-		return s, err
+	typeName, err := storageTypeToString(s.sType)
+	if err != nil {
+		return err
 	}
+	s.sTypeName = typeName
+	s.sTypeVersion = "1"
 
-	return s, nil
+	shared.LogDebugf("Initializing a DIR driver.")
+	return nil
 }
 
-func (s *storageDir) ContainerCreate(container container) error {
-	cPath := container.Path()
-	if err := os.MkdirAll(cPath, 0755); err != nil {
-		return fmt.Errorf("Error creating containers directory")
-	}
-
-	if container.IsPrivileged() {
-		if err := os.Chmod(cPath, 0700); err != nil {
-			return err
-		}
-	}
-
-	return container.TemplateApply("create")
-}
-
-func (s *storageDir) ContainerCreateFromImage(
-	container container, imageFingerprint string) error {
-
-	rootfsPath := container.RootfsPath()
-	if err := os.MkdirAll(rootfsPath, 0755); err != nil {
-		return fmt.Errorf("Error creating rootfs directory")
-	}
-
-	if container.IsPrivileged() {
-		if err := os.Chmod(container.Path(), 0700); err != nil {
-			return err
-		}
-	}
-
-	imagePath := shared.VarPath("images", imageFingerprint)
-	if err := unpackImage(s.d, imagePath, container.Path()); err != nil {
-		s.ContainerDelete(container)
+// Initialize a full storage interface.
+func (s *storageDir) StoragePoolInit() error {
+	err := s.StorageCoreInit()
+	if err != nil {
 		return err
 	}
 
-	if !container.IsPrivileged() {
-		if err := s.shiftRootfs(container); err != nil {
-			s.ContainerDelete(container)
+	return nil
+}
+
+// Initialize a full storage interface.
+func (s *storageDir) StoragePoolCheck() error {
+	shared.LogDebugf("Checking DIR storage pool \"%s\".", s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) StoragePoolCreate() error {
+	shared.LogInfof("Creating DIR storage pool \"%s\".", s.pool.Name)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		source = filepath.Join(shared.VarPath("storage-pools"), s.pool.Name)
+		s.pool.Config["source"] = source
+	} else {
+		cleanSource := filepath.Clean(source)
+		lxdDir := shared.VarPath()
+		poolMntPoint := getStoragePoolMountPoint(s.pool.Name)
+		if strings.HasPrefix(cleanSource, lxdDir) && cleanSource != poolMntPoint {
+			return fmt.Errorf("DIR storage pool requests in LXD directory \"%s\" are only valid under \"%s\"\n(e.g. source=%s)", shared.VarPath(), shared.VarPath("storage-pools"), poolMntPoint)
+		}
+	}
+
+	revert := true
+	if !shared.PathExists(source) {
+		err := os.MkdirAll(source, 0711)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if !revert {
+				return
+			}
+			os.Remove(source)
+		}()
+	}
+
+	prefix := shared.VarPath("storage-pools")
+	if !strings.HasPrefix(source, prefix) {
+		// symlink from storage-pools to pool x
+		storagePoolSymlink := getStoragePoolMountPoint(s.pool.Name)
+		err := os.Symlink(source, storagePoolSymlink)
+		if err != nil {
 			return err
 		}
 	}
 
-	return container.TemplateApply("create")
+	err := s.StoragePoolCheck()
+	if err != nil {
+		return err
+	}
+
+	revert = false
+
+	shared.LogInfof("Created DIR storage pool \"%s\".", s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) StoragePoolDelete() error {
+	shared.LogInfof("Deleting DIR storage pool \"%s\".", s.pool.Name)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
+	}
+
+	if shared.PathExists(source) {
+		err := os.RemoveAll(source)
+		if err != nil {
+			return err
+		}
+	}
+
+	prefix := shared.VarPath("storage-pools")
+	if !strings.HasPrefix(source, prefix) {
+		storagePoolSymlink := getStoragePoolMountPoint(s.pool.Name)
+		if !shared.PathExists(storagePoolSymlink) {
+			return nil
+		}
+
+		err := os.Remove(storagePoolSymlink)
+		if err != nil {
+			return err
+		}
+	}
+
+	shared.LogInfof("Deleted DIR storage pool \"%s\".", s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) StoragePoolMount() (bool, error) {
+	return true, nil
+}
+
+func (s *storageDir) StoragePoolUmount() (bool, error) {
+	return true, nil
+}
+
+func (s *storageDir) GetStoragePoolWritable() api.StoragePoolPut {
+	return s.pool.Writable()
+}
+
+func (s *storageDir) GetStoragePoolVolumeWritable() api.StorageVolumePut {
+	return s.volume.Writable()
+}
+
+func (s *storageDir) SetStoragePoolWritable(writable *api.StoragePoolPut) {
+	s.pool.StoragePoolPut = *writable
+}
+
+func (s *storageDir) SetStoragePoolVolumeWritable(writable *api.StorageVolumePut) {
+	s.volume.StorageVolumePut = *writable
+}
+
+func (s *storageDir) GetContainerPoolInfo() (int64, string) {
+	return s.poolID, s.pool.Name
+}
+
+func (s *storageDir) StoragePoolUpdate(writable *api.StoragePoolPut, changedConfig []string) error {
+	return fmt.Errorf("Dir storage properties cannot be changed.")
+}
+
+// Functions dealing with storage pools.
+func (s *storageDir) StoragePoolVolumeCreate() error {
+	shared.LogInfof("Creating DIR storage volume \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
+	}
+
+	storageVolumePath := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
+	err := os.MkdirAll(storageVolumePath, 0711)
+	if err != nil {
+		return err
+	}
+
+	shared.LogInfof("Created DIR storage volume \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) StoragePoolVolumeDelete() error {
+	shared.LogInfof("Deleting DIR storage volume \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
+	}
+
+	storageVolumePath := getStoragePoolVolumeMountPoint(s.pool.Name, s.volume.Name)
+	if !shared.PathExists(storageVolumePath) {
+		return nil
+	}
+
+	err := os.RemoveAll(storageVolumePath)
+	if err != nil {
+		return err
+	}
+
+	shared.LogInfof("Deleted DIR storage volume \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) StoragePoolVolumeMount() (bool, error) {
+	return true, nil
+}
+
+func (s *storageDir) StoragePoolVolumeUmount() (bool, error) {
+	return true, nil
+}
+
+func (s *storageDir) StoragePoolVolumeUpdate(changedConfig []string) error {
+	return fmt.Errorf("Dir storage properties cannot be changed.")
+}
+
+func (s *storageDir) ContainerStorageReady(name string) bool {
+	containerMntPoint := getContainerMountPoint(s.pool.Name, name)
+	ok, _ := shared.PathIsEmpty(containerMntPoint)
+	return !ok
+}
+
+func (s *storageDir) ContainerCreate(container container) error {
+	shared.LogDebugf("Creating empty DIR storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
+	}
+
+	containerMntPoint := getContainerMountPoint(s.pool.Name, container.Name())
+	err := createContainerMountpoint(containerMntPoint, container.Path(), container.IsPrivileged())
+	if err != nil {
+		return err
+	}
+	revert := true
+	defer func() {
+		if !revert {
+			return
+		}
+		deleteContainerMountpoint(containerMntPoint, container.Path(), s.GetStorageTypeName())
+	}()
+
+	err = container.TemplateApply("create")
+	if err != nil {
+		return err
+	}
+
+	revert = false
+
+	shared.LogDebugf("Created empty DIR storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) ContainerCreateFromImage(container container, imageFingerprint string) error {
+	shared.LogDebugf("Creating DIR storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
+	}
+
+	privileged := container.IsPrivileged()
+	containerName := container.Name()
+	containerMntPoint := getContainerMountPoint(s.pool.Name, containerName)
+	err := createContainerMountpoint(containerMntPoint, container.Path(), privileged)
+	if err != nil {
+		return err
+	}
+	revert := true
+	defer func() {
+		if !revert {
+			return
+		}
+		s.ContainerDelete(container)
+	}()
+
+	imagePath := shared.VarPath("images", imageFingerprint)
+	err = unpackImage(s.d, imagePath, containerMntPoint, storageTypeDir)
+	if err != nil {
+		return err
+	}
+
+	if !privileged {
+		err := s.shiftRootfs(container)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = container.TemplateApply("create")
+	if err != nil {
+		return err
+	}
+
+	revert = false
+
+	shared.LogDebugf("Created DIR storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	return nil
 }
 
 func (s *storageDir) ContainerCanRestore(container container, sourceContainer container) error {
@@ -80,94 +304,237 @@ func (s *storageDir) ContainerCanRestore(container container, sourceContainer co
 }
 
 func (s *storageDir) ContainerDelete(container container) error {
-	cPath := container.Path()
+	shared.LogDebugf("Deleting DIR storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
 
-	if !shared.PathExists(cPath) {
-		return nil
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
 	}
 
-	err := os.RemoveAll(cPath)
-	if err != nil {
-		// RemovaAll fails on very long paths, so attempt an rm -Rf
-		output, err := exec.Command("rm", "-Rf", cPath).CombinedOutput()
+	// Delete the container on its storage pool:
+	// ${POOL}/containers/<container_name>
+	containerName := container.Name()
+	containerMntPoint := getContainerMountPoint(s.pool.Name, containerName)
+	if shared.PathExists(containerMntPoint) {
+		err := os.RemoveAll(containerMntPoint)
 		if err != nil {
-			s.log.Error("ContainerDelete: failed", log.Ctx{"cPath": cPath, "output": output})
-			return fmt.Errorf("Error cleaning up %s: %s", cPath, string(output))
+			// RemovaAll fails on very long paths, so attempt an rm -Rf
+			output, err := shared.RunCommand("rm", "-Rf", containerMntPoint)
+			if err != nil {
+				return fmt.Errorf("Error removing %s: %s.", containerMntPoint, output)
+			}
 		}
 	}
 
-	return nil
-}
-
-func (s *storageDir) ContainerCopy(
-	container container, sourceContainer container) error {
-
-	oldPath := sourceContainer.Path()
-	newPath := container.Path()
-
-	/*
-	 * Copy by using rsync
-	 */
-	output, err := storageRsyncCopy(oldPath, newPath)
-	if err != nil {
-		s.ContainerDelete(container)
-		s.log.Error("ContainerCopy: rsync failed", log.Ctx{"output": string(output)})
-		return fmt.Errorf("rsync failed: %s", string(output))
-	}
-
-	err = s.setUnprivUserAcl(sourceContainer, container.Path())
+	err := deleteContainerMountpoint(containerMntPoint, container.Path(), s.GetStorageTypeName())
 	if err != nil {
 		return err
 	}
 
-	return container.TemplateApply("copy")
-}
-
-func (s *storageDir) ContainerStart(name string, path string) error {
-	return nil
-}
-
-func (s *storageDir) ContainerStop(name string, path string) error {
-	return nil
-}
-
-func (s *storageDir) ContainerRename(container container, newName string) error {
-	oldName := container.Name()
-
-	oldPath := container.Path()
-	newPath := containerPath(newName, false)
-
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return err
-	}
-
-	if shared.PathExists(shared.VarPath(fmt.Sprintf("snapshots/%s", oldName))) {
-		err := os.Rename(shared.VarPath(fmt.Sprintf("snapshots/%s", oldName)), shared.VarPath(fmt.Sprintf("snapshots/%s", newName)))
+	// Delete potential leftover snapshot mountpoints.
+	snapshotMntPoint := getSnapshotMountPoint(s.pool.Name, container.Name())
+	if shared.PathExists(snapshotMntPoint) {
+		err := os.RemoveAll(snapshotMntPoint)
 		if err != nil {
 			return err
 		}
 	}
 
+	// Delete potential leftover snapshot symlinks:
+	// ${LXD_DIR}/snapshots/<container_name> -> ${POOL}/snapshots/<container_name>
+	snapshotSymlink := shared.VarPath("snapshots", container.Name())
+	if shared.PathExists(snapshotSymlink) {
+		err := os.Remove(snapshotSymlink)
+		if err != nil {
+			return err
+		}
+	}
+
+	shared.LogDebugf("Deleted DIR storage volume for container \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
 	return nil
 }
 
-func (s *storageDir) ContainerRestore(
-	container container, sourceContainer container) error {
+func (s *storageDir) copyContainer(target container, source container) error {
+	sourceContainerMntPoint := getContainerMountPoint(s.pool.Name, source.Name())
+	if source.IsSnapshot() {
+		sourceContainerMntPoint = getSnapshotMountPoint(s.pool.Name, source.Name())
+	}
+	targetContainerMntPoint := getContainerMountPoint(s.pool.Name, target.Name())
+
+	err := createContainerMountpoint(targetContainerMntPoint, target.Path(), target.IsPrivileged())
+	if err != nil {
+		return err
+	}
+
+	output, err := storageRsyncCopy(sourceContainerMntPoint, targetContainerMntPoint)
+	if err != nil {
+		return fmt.Errorf("Failed to rsync container: %s: %s.", string(output), err)
+	}
+
+	err = s.setUnprivUserAcl(source, targetContainerMntPoint)
+	if err != nil {
+		return err
+	}
+
+	err = target.TemplateApply("copy")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *storageDir) copySnapshot(target container, source container) error {
+	sourceName := source.Name()
+	targetName := target.Name()
+	sourceContainerMntPoint := getSnapshotMountPoint(s.pool.Name, sourceName)
+	targetContainerMntPoint := getSnapshotMountPoint(s.pool.Name, targetName)
+
+	fields := strings.SplitN(target.Name(), shared.SnapshotDelimiter, 2)
+	containersPath := getSnapshotMountPoint(s.pool.Name, fields[0])
+	snapshotMntPointSymlinkTarget := shared.VarPath("storage-pools", s.pool.Name, "snapshots", fields[0])
+	snapshotMntPointSymlink := shared.VarPath("snapshots", fields[0])
+	err := createSnapshotMountpoint(containersPath, snapshotMntPointSymlinkTarget, snapshotMntPointSymlink)
+	if err != nil {
+		return err
+	}
+
+	output, err := storageRsyncCopy(sourceContainerMntPoint, targetContainerMntPoint)
+	if err != nil {
+		return fmt.Errorf("Failed to rsync container: %s: %s.", string(output), err)
+	}
+
+	return nil
+}
+
+func (s *storageDir) ContainerCopy(target container, source container, containerOnly bool) error {
+	shared.LogDebugf("Copying DIR container storage %s -> %s.", source.Name(), target.Name())
+
+	ourStart, err := source.StorageStart()
+	if err != nil {
+		return err
+	}
+	if ourStart {
+		defer source.StorageStop()
+	}
+
+	_, sourcePool := source.Storage().GetContainerPoolInfo()
+	_, targetPool := target.Storage().GetContainerPoolInfo()
+	if sourcePool != targetPool {
+		return fmt.Errorf("Copying containers between different storage pools is not implemented.")
+	}
+
+	err = s.copyContainer(target, source)
+	if err != nil {
+		return err
+	}
+
+	if containerOnly {
+		shared.LogDebugf("Copied DIR container storage %s -> %s.", source.Name(), target.Name())
+		return nil
+	}
+
+	snapshots, err := source.Snapshots()
+	if err != nil {
+		return err
+	}
+
+	if len(snapshots) == 0 {
+		shared.LogDebugf("Copied DIR container storage %s -> %s.", source.Name(), target.Name())
+		return nil
+	}
+
+	for _, snap := range snapshots {
+		sourceSnapshot, err := containerLoadByName(s.d, snap.Name())
+		if err != nil {
+			return err
+		}
+
+		fields := strings.SplitN(snap.Name(), shared.SnapshotDelimiter, 2)
+		newSnapName := fmt.Sprintf("%s/%s", target.Name(), fields[1])
+		targetSnapshot, err := containerLoadByName(s.d, newSnapName)
+		if err != nil {
+			return err
+		}
+
+		err = s.copySnapshot(targetSnapshot, sourceSnapshot)
+		if err != nil {
+			return err
+		}
+	}
+
+	shared.LogDebugf("Copied DIR container storage %s -> %s.", source.Name(), target.Name())
+	return nil
+}
+
+func (s *storageDir) ContainerMount(name string, path string) (bool, error) {
+	return true, nil
+}
+
+func (s *storageDir) ContainerUmount(name string, path string) (bool, error) {
+	return true, nil
+}
+
+func (s *storageDir) ContainerRename(container container, newName string) error {
+	shared.LogDebugf("Renaming DIR storage volume for container \"%s\" from %s -> %s.", s.volume.Name, s.volume.Name, newName)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
+	}
+
+	oldContainerMntPoint := getContainerMountPoint(s.pool.Name, container.Name())
+	oldContainerSymlink := shared.VarPath("containers", container.Name())
+	newContainerMntPoint := getContainerMountPoint(s.pool.Name, newName)
+	newContainerSymlink := shared.VarPath("containers", newName)
+	err := renameContainerMountpoint(oldContainerMntPoint, oldContainerSymlink, newContainerMntPoint, newContainerSymlink)
+	if err != nil {
+		return err
+	}
+
+	// Rename the snapshot mountpoint for the container if existing:
+	// ${POOL}/snapshots/<old_container_name> to ${POOL}/snapshots/<new_container_name>
+	oldSnapshotsMntPoint := getSnapshotMountPoint(s.pool.Name, container.Name())
+	newSnapshotsMntPoint := getSnapshotMountPoint(s.pool.Name, newName)
+	if shared.PathExists(oldSnapshotsMntPoint) {
+		err = os.Rename(oldSnapshotsMntPoint, newSnapshotsMntPoint)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Remove the old snapshot symlink:
+	// ${LXD_DIR}/snapshots/<old_container_name>
+	oldSnapshotSymlink := shared.VarPath("snapshots", container.Name())
+	newSnapshotSymlink := shared.VarPath("snapshots", newName)
+	if shared.PathExists(oldSnapshotSymlink) {
+		err := os.Remove(oldSnapshotSymlink)
+		if err != nil {
+			return err
+		}
+
+		// Create the new snapshot symlink:
+		// ${LXD_DIR}/snapshots/<new_container_name> -> ${POOL}/snapshots/<new_container_name>
+		err = os.Symlink(newSnapshotsMntPoint, newSnapshotSymlink)
+		if err != nil {
+			return err
+		}
+	}
+
+	shared.LogDebugf("Renamed DIR storage volume for container \"%s\" from %s -> %s.", s.volume.Name, s.volume.Name, newName)
+	return nil
+}
+
+func (s *storageDir) ContainerRestore(container container, sourceContainer container) error {
+	shared.LogDebugf("Restoring DIR storage volume for container \"%s\" from %s -> %s.", s.volume.Name, sourceContainer.Name(), container.Name())
 
 	targetPath := container.Path()
 	sourcePath := sourceContainer.Path()
 
 	// Restore using rsync
-	output, err := storageRsyncCopy(
-		sourcePath,
-		targetPath)
-
+	output, err := storageRsyncCopy(sourcePath, targetPath)
 	if err != nil {
-		s.log.Error(
-			"ContainerRestore: rsync failed",
-			log.Ctx{"output": string(output)})
-
-		return err
+		return fmt.Errorf("Failed to rsync container: %s: %s.", string(output), err)
 	}
 
 	// Now allow unprivileged users to access its data.
@@ -175,6 +542,7 @@ func (s *storageDir) ContainerRestore(
 		return err
 	}
 
+	shared.LogDebugf("Restored DIR storage volume for container \"%s\" from %s -> %s.", s.volume.Name, sourceContainer.Name(), container.Name())
 	return nil
 }
 
@@ -186,104 +554,184 @@ func (s *storageDir) ContainerGetUsage(container container) (int64, error) {
 	return -1, fmt.Errorf("The directory container backend doesn't support quotas.")
 }
 
-func (s *storageDir) ContainerSnapshotCreate(
-	snapshotContainer container, sourceContainer container) error {
+func (s *storageDir) ContainerSnapshotCreate(snapshotContainer container, sourceContainer container) error {
+	shared.LogDebugf("Creating DIR storage volume for snapshot \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
 
-	oldPath := sourceContainer.Path()
-	newPath := snapshotContainer.Path()
+	// Create the path for the snapshot.
+	targetContainerName := snapshotContainer.Name()
+	targetContainerMntPoint := getSnapshotMountPoint(s.pool.Name, targetContainerName)
+	err := os.MkdirAll(targetContainerMntPoint, 0711)
+	if err != nil {
+		return err
+	}
 
-	/*
-	 * Copy by using rsync
-	 */
 	rsync := func(snapshotContainer container, oldPath string, newPath string) error {
 		output, err := storageRsyncCopy(oldPath, newPath)
 		if err != nil {
 			s.ContainerDelete(snapshotContainer)
-			s.log.Error("ContainerSnapshotCreate: rsync failed",
-				log.Ctx{"output": string(output)})
-
-			return fmt.Errorf("rsync failed: %s", string(output))
+			return fmt.Errorf("Failed to rsync: %s: %s.", string(output), err)
 		}
 		return nil
 	}
 
-	if err := rsync(snapshotContainer, oldPath, newPath); err != nil {
+	ourStart, err := sourceContainer.StorageStart()
+	if err != nil {
+		return err
+	}
+	if ourStart {
+		defer sourceContainer.StorageStop()
+	}
+
+	_, sourcePool := sourceContainer.Storage().GetContainerPoolInfo()
+	sourceContainerName := sourceContainer.Name()
+	sourceContainerMntPoint := getContainerMountPoint(sourcePool, sourceContainerName)
+	err = rsync(snapshotContainer, sourceContainerMntPoint, targetContainerMntPoint)
+	if err != nil {
 		return err
 	}
 
 	if sourceContainer.IsRunning() {
-		/* This is done to ensure consistency when snapshotting. But we
-		 * probably shouldn't fail just because of that.
-		 */
-		s.log.Debug("ContainerSnapshotCreate: trying to freeze and rsync again to ensure consistency.")
-		if err := sourceContainer.Freeze(); err != nil {
-			s.log.Warn("ContainerSnapshotCreate: trying to freeze and rsync again failed.")
+		// This is done to ensure consistency when snapshotting. But we
+		// probably shouldn't fail just because of that.
+		shared.LogDebugf("Trying to freeze and rsync again to ensure consistency.")
+
+		err := sourceContainer.Freeze()
+		if err != nil {
+			shared.LogErrorf("Trying to freeze and rsync again failed.")
 			return nil
 		}
 
-		if err := rsync(snapshotContainer, oldPath, newPath); err != nil {
+		err = rsync(snapshotContainer, sourceContainerMntPoint, targetContainerMntPoint)
+		if err != nil {
 			return err
 		}
 
 		defer sourceContainer.Unfreeze()
 	}
 
+	// Check if the symlink
+	// ${LXD_DIR}/snapshots/<source_container_name> -> ${POOL_PATH}/snapshots/<source_container_name>
+	// exists and if not create it.
+	sourceContainerSymlink := shared.VarPath("snapshots", sourceContainerName)
+	sourceContainerSymlinkTarget := getSnapshotMountPoint(sourcePool, sourceContainerName)
+	if !shared.PathExists(sourceContainerSymlink) {
+		err = os.Symlink(sourceContainerSymlinkTarget, sourceContainerSymlink)
+		if err != nil {
+			return err
+		}
+	}
+
+	shared.LogDebugf("Created DIR storage volume for snapshot \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
 	return nil
 }
 
 func (s *storageDir) ContainerSnapshotCreateEmpty(snapshotContainer container) error {
-	return os.MkdirAll(snapshotContainer.Path(), 0700)
-}
+	shared.LogDebugf("Creating empty DIR storage volume for snapshot \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
 
-func (s *storageDir) ContainerSnapshotDelete(
-	snapshotContainer container) error {
-	err := s.ContainerDelete(snapshotContainer)
+	// Create the path for the snapshot.
+	targetContainerName := snapshotContainer.Name()
+	targetContainerMntPoint := getSnapshotMountPoint(s.pool.Name, targetContainerName)
+	err := os.MkdirAll(targetContainerMntPoint, 0711)
 	if err != nil {
-		return fmt.Errorf("Error deleting snapshot %s: %s", snapshotContainer.Name(), err)
+		return err
 	}
+	revert := true
+	defer func() {
+		if !revert {
+			return
+		}
+		s.ContainerSnapshotDelete(snapshotContainer)
+	}()
 
-	oldPathParent := filepath.Dir(snapshotContainer.Path())
-	if ok, _ := shared.PathIsEmpty(oldPathParent); ok {
-		os.Remove(oldPathParent)
-	}
-
-	return nil
-}
-
-func (s *storageDir) ContainerSnapshotRename(
-	snapshotContainer container, newName string) error {
-
-	oldPath := snapshotContainer.Path()
-	newPath := containerPath(newName, true)
-
-	// Create the new parent.
-	if strings.Contains(snapshotContainer.Name(), "/") {
-		if !shared.PathExists(filepath.Dir(newPath)) {
-			os.MkdirAll(filepath.Dir(newPath), 0700)
+	// Check if the symlink
+	// ${LXD_DIR}/snapshots/<source_container_name> -> ${POOL_PATH}/snapshots/<source_container_name>
+	// exists and if not create it.
+	fields := strings.SplitN(targetContainerName, shared.SnapshotDelimiter, 2)
+	sourceContainerName := fields[0]
+	sourceContainerSymlink := shared.VarPath("snapshots", sourceContainerName)
+	sourceContainerSymlinkTarget := getSnapshotMountPoint(s.pool.Name, sourceContainerName)
+	if !shared.PathExists(sourceContainerSymlink) {
+		err := os.Symlink(sourceContainerSymlinkTarget, sourceContainerSymlink)
+		if err != nil {
+			return err
 		}
 	}
 
-	// Now rename the snapshot.
-	if err := os.Rename(oldPath, newPath); err != nil {
+	revert = false
+
+	shared.LogDebugf("Created empty DIR storage volume for snapshot \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) ContainerSnapshotDelete(snapshotContainer container) error {
+	shared.LogDebugf("Deleting DIR storage volume for snapshot \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+
+	source := s.pool.Config["source"]
+	if source == "" {
+		return fmt.Errorf("No \"source\" property found for the storage pool.")
+	}
+
+	// Delete the snapshot on its storage pool:
+	// ${POOL}/snapshots/<snapshot_name>
+	snapshotContainerName := snapshotContainer.Name()
+	snapshotContainerMntPoint := getSnapshotMountPoint(s.pool.Name, snapshotContainerName)
+	if shared.PathExists(snapshotContainerMntPoint) {
+		err := os.RemoveAll(snapshotContainerMntPoint)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Check if we can remove the snapshot symlink:
+	// ${LXD_DIR}/snapshots/<container_name> -> ${POOL}/snapshots/<container_name>
+	// by checking if the directory is empty.
+	fields := strings.SplitN(snapshotContainerName, shared.SnapshotDelimiter, 2)
+	sourceContainerName := fields[0]
+	snapshotContainerPath := getSnapshotMountPoint(s.pool.Name, sourceContainerName)
+	empty, _ := shared.PathIsEmpty(snapshotContainerPath)
+	if empty == true {
+		// Remove the snapshot directory for the container:
+		// ${POOL}/snapshots/<source_container_name>
+		err := os.Remove(snapshotContainerPath)
+		if err != nil {
+			return err
+		}
+
+		snapshotSymlink := shared.VarPath("snapshots", sourceContainerName)
+		if shared.PathExists(snapshotSymlink) {
+			err := os.Remove(snapshotSymlink)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	shared.LogDebugf("Deleted DIR storage volume for snapshot \"%s\" on storage pool \"%s\".", s.volume.Name, s.pool.Name)
+	return nil
+}
+
+func (s *storageDir) ContainerSnapshotRename(snapshotContainer container, newName string) error {
+	shared.LogDebugf("Renaming DIR storage volume for snapshot \"%s\" from %s -> %s.", s.volume.Name, s.volume.Name, newName)
+
+	// Rename the mountpoint for the snapshot:
+	// ${POOL}/snapshots/<old_snapshot_name> to ${POOL}/snapshots/<new_snapshot_name>
+	oldSnapshotMntPoint := getSnapshotMountPoint(s.pool.Name, snapshotContainer.Name())
+	newSnapshotMntPoint := getSnapshotMountPoint(s.pool.Name, newName)
+	err := os.Rename(oldSnapshotMntPoint, newSnapshotMntPoint)
+	if err != nil {
 		return err
 	}
 
-	// Remove the old parent (on container rename) if its empty.
-	if strings.Contains(snapshotContainer.Name(), "/") {
-		if ok, _ := shared.PathIsEmpty(filepath.Dir(oldPath)); ok {
-			os.Remove(filepath.Dir(oldPath))
-		}
-	}
-
+	shared.LogDebugf("Renamed DIR storage volume for snapshot \"%s\" from %s -> %s.", s.volume.Name, s.volume.Name, newName)
 	return nil
 }
 
-func (s *storageDir) ContainerSnapshotStart(container container) error {
-	return nil
+func (s *storageDir) ContainerSnapshotStart(container container) (bool, error) {
+	return true, nil
 }
 
-func (s *storageDir) ContainerSnapshotStop(container container) error {
-	return nil
+func (s *storageDir) ContainerSnapshotStop(container container) (bool, error) {
+	return true, nil
 }
 
 func (s *storageDir) ImageCreate(fingerprint string) error {
@@ -291,7 +739,20 @@ func (s *storageDir) ImageCreate(fingerprint string) error {
 }
 
 func (s *storageDir) ImageDelete(fingerprint string) error {
+	err := s.deleteImageDbPoolVolume(fingerprint)
+	if err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func (s *storageDir) ImageMount(fingerprint string) (bool, error) {
+	return true, nil
+}
+
+func (s *storageDir) ImageUmount(fingerprint string) (bool, error) {
+	return true, nil
 }
 
 func (s *storageDir) MigrationType() MigrationFSType {
@@ -302,10 +763,10 @@ func (s *storageDir) PreservesInodes() bool {
 	return false
 }
 
-func (s *storageDir) MigrationSource(container container) (MigrationStorageSourceDriver, error) {
-	return rsyncMigrationSource(container)
+func (s *storageDir) MigrationSource(container container, containerOnly bool) (MigrationStorageSourceDriver, error) {
+	return rsyncMigrationSource(container, containerOnly)
 }
 
-func (s *storageDir) MigrationSink(live bool, container container, snapshots []*Snapshot, conn *websocket.Conn, srcIdmap *shared.IdmapSet, op *operation) error {
-	return rsyncMigrationSink(live, container, snapshots, conn, srcIdmap, op)
+func (s *storageDir) MigrationSink(live bool, container container, snapshots []*Snapshot, conn *websocket.Conn, srcIdmap *shared.IdmapSet, op *operation, containerOnly bool) error {
+	return rsyncMigrationSink(live, container, snapshots, conn, srcIdmap, op, containerOnly)
 }

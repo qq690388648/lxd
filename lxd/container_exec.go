@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -27,8 +28,8 @@ type execWs struct {
 	container container
 	env       map[string]string
 
-	rootUid          int
-	rootGid          int
+	rootUid          int64
+	rootGid          int64
 	conns            map[int]*websocket.Conn
 	connsLock        sync.Mutex
 	allConnected     chan bool
@@ -149,14 +150,34 @@ func (s *execWs) Do(op *operation) error {
 			}
 
 			for {
-				mt, r, err := s.conns[-1].NextReader()
+				s.connsLock.Lock()
+				conn := s.conns[-1]
+				s.connsLock.Unlock()
+
+				mt, r, err := conn.NextReader()
 				if mt == websocket.CloseMessage {
 					break
 				}
 
 				if err != nil {
 					shared.LogDebugf("Got error getting next reader %s", err)
-					break
+					er, ok := err.(*websocket.CloseError)
+					if !ok {
+						break
+					}
+
+					if er.Code != websocket.CloseAbnormalClosure {
+						break
+					}
+
+					// If an abnormal closure occured, kill the attached process.
+					err := syscall.Kill(attachedChildPid, syscall.SIGKILL)
+					if err != nil {
+						shared.LogDebugf("Failed to send SIGKILL to pid %d.", attachedChildPid)
+					} else {
+						shared.LogDebugf("Sent SIGKILL to pid %d.", attachedChildPid)
+					}
+					return
 				}
 
 				buf, err := ioutil.ReadAll(r)
@@ -201,10 +222,16 @@ func (s *execWs) Do(op *operation) error {
 		}()
 
 		go func() {
-			readDone, writeDone := shared.WebsocketExecMirror(s.conns[0], ptys[0], ptys[0], attachedChildIsDead, int(ptys[0].Fd()))
+			s.connsLock.Lock()
+			conn := s.conns[0]
+			s.connsLock.Unlock()
+
+			readDone, writeDone := shared.WebsocketExecMirror(conn, ptys[0], ptys[0], attachedChildIsDead, int(ptys[0].Fd()))
+
 			<-readDone
 			<-writeDone
-			s.conns[0].Close()
+
+			conn.Close()
 			wgEOF.Done()
 		}()
 
@@ -213,10 +240,18 @@ func (s *execWs) Do(op *operation) error {
 		for i := 0; i < len(ttys); i++ {
 			go func(i int) {
 				if i == 0 {
-					<-shared.WebsocketRecvStream(ttys[i], s.conns[i])
+					s.connsLock.Lock()
+					conn := s.conns[i]
+					s.connsLock.Unlock()
+
+					<-shared.WebsocketRecvStream(ttys[i], conn)
 					ttys[i].Close()
 				} else {
-					<-shared.WebsocketSendStream(s.conns[i], ptys[i], -1)
+					s.connsLock.Lock()
+					conn := s.conns[i]
+					s.connsLock.Unlock()
+
+					<-shared.WebsocketSendStream(conn, ptys[i], -1)
 					ptys[i].Close()
 					wgEOF.Done()
 				}
@@ -229,12 +264,16 @@ func (s *execWs) Do(op *operation) error {
 			tty.Close()
 		}
 
-		if s.conns[-1] == nil {
+		s.connsLock.Lock()
+		conn := s.conns[-1]
+		s.connsLock.Unlock()
+
+		if conn == nil {
 			if s.interactive {
 				controlExit <- true
 			}
 		} else {
-			s.conns[-1].Close()
+			conn.Close()
 		}
 
 		attachedChildIsDead <- true
@@ -254,7 +293,7 @@ func (s *execWs) Do(op *operation) error {
 		return cmdErr
 	}
 
-	pid, attachedPid, err := s.container.Exec(s.command, s.env, stdin, stdout, stderr, false)
+	cmd, _, attachedPid, err := s.container.Exec(s.command, s.env, stdin, stdout, stderr, false)
 	if err != nil {
 		return err
 	}
@@ -263,28 +302,20 @@ func (s *execWs) Do(op *operation) error {
 		attachedChildIsBorn <- attachedPid
 	}
 
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return finisher(-1, fmt.Errorf("Failed finding process: %q", err))
-	}
-
-	procState, err := proc.Wait()
-	if err != nil {
-		return finisher(-1, fmt.Errorf("Failed waiting on process %d: %q", pid, err))
-	}
-
-	if procState.Success() {
+	err = cmd.Wait()
+	if err == nil {
 		return finisher(0, nil)
 	}
 
-	status, ok := procState.Sys().(syscall.WaitStatus)
+	exitErr, ok := err.(*exec.ExitError)
 	if ok {
-		if status.Exited() {
+		status, ok := exitErr.Sys().(syscall.WaitStatus)
+		if ok {
 			return finisher(status.ExitStatus(), nil)
 		}
 
 		if status.Signaled() {
-			// COMMENT(brauner): 128 + n == Fatal error signal "n"
+			// 128 + n == Fatal error signal "n"
 			return finisher(128+int(status.Signal()), nil)
 		}
 	}
@@ -361,10 +392,16 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 	if post.WaitForWS {
 		ws := &execWs{}
 		ws.fds = map[int]string{}
-		idmapset := c.IdmapSet()
+
+		idmapset, err := c.IdmapSet()
+		if err != nil {
+			return InternalError(err)
+		}
+
 		if idmapset != nil {
 			ws.rootUid, ws.rootGid = idmapset.ShiftIntoNs(0, 0)
 		}
+
 		ws.conns = map[int]*websocket.Conn{}
 		ws.conns[-1] = nil
 		ws.conns[0] = nil
@@ -420,7 +457,7 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 			defer stderr.Close()
 
 			// Run the command
-			cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, stdout, stderr, true)
+			_, cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, stdout, stderr, true)
 
 			// Update metadata with the right URLs
 			metadata["return"] = cmdResult
@@ -429,7 +466,7 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 				"2": fmt.Sprintf("/%s/containers/%s/logs/%s", version.APIVersion, c.Name(), filepath.Base(stderr.Name())),
 			}
 		} else {
-			cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, nil, nil, true)
+			_, cmdResult, _, cmdErr = c.Exec(post.Command, env, nil, nil, nil, true)
 			metadata["return"] = cmdResult
 		}
 

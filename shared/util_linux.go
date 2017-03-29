@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,7 +92,7 @@ void configure_pty(int fd) {
 	return;
 }
 
-void create_pty(int *master, int *slave, int uid, int gid) {
+void create_pty(int *master, int *slave, uid_t uid, gid_t gid) {
 	if (openpty(master, slave, NULL, NULL, NULL) < 0) {
 		fprintf(stderr, "Failed to openpty: %s\n", strerror(errno));
 		return;
@@ -244,11 +245,11 @@ func ShiftOwner(basepath string, path string, uid int, gid int) error {
 	return nil
 }
 
-func OpenPty(uid, gid int) (master *os.File, slave *os.File, err error) {
+func OpenPty(uid, gid int64) (master *os.File, slave *os.File, err error) {
 	fd_master := C.int(-1)
 	fd_slave := C.int(-1)
-	rootUid := C.int(uid)
-	rootGid := C.int(gid)
+	rootUid := C.uid_t(uid)
+	rootGid := C.gid_t(gid)
 
 	C.create_pty(&fd_master, &fd_slave, rootUid, rootGid)
 
@@ -368,7 +369,7 @@ func GetFileStat(p string) (uid int, gid int, major int, minor int,
 func IsMountPoint(name string) bool {
 	_, err := exec.LookPath("mountpoint")
 	if err == nil {
-		err = exec.Command("mountpoint", "-q", name).Run()
+		_, err = RunCommand("mountpoint", "-q", name)
 		if err != nil {
 			return false
 		}
@@ -543,7 +544,6 @@ func ExecReaderToChannel(r io.Reader, bufferSize int, exited <-chan bool, fd int
 		close(ch)
 	}
 
-	// COMMENT(brauner):
 	// [1]: This function has just one job: Dealing with the case where we
 	// are running an interactive shell session where we put a process in
 	// the background that does hold stdin/stdout open, but does not
@@ -590,14 +590,12 @@ func ExecReaderToChannel(r io.Reader, bufferSize int, exited <-chan bool, fd int
 
 			ret, revents, err := GetPollRevents(fd, -1, (POLLIN | POLLPRI | POLLERR | POLLHUP | POLLRDHUP))
 			if ret < 0 {
-				// COMMENT(brauner):
 				// This condition is only reached in cases where we are massively f*cked since we even handle
 				// EINTR in the underlying C wrapper around poll(). So let's exit here.
 				LogErrorf("Failed to poll(POLLIN | POLLPRI | POLLERR | POLLHUP | POLLRDHUP) on file descriptor: %s. Exiting.", err)
 				return
 			}
 
-			// COMMENT(brauner):
 			// [2]: If the process exits before all its data has been read by us and no other process holds stdin or
 			// stdout open, then we will observe a (POLLHUP | POLLRDHUP | POLLIN) event. This means, we need to
 			// keep on reading from the pty file descriptor until we get a simple POLLHUP back.
@@ -614,7 +612,6 @@ func ExecReaderToChannel(r io.Reader, bufferSize int, exited <-chan bool, fd int
 			}
 
 			if ((revents & (POLLIN | POLLPRI)) > 0) && !both {
-				// COMMENT(brauner):
 				// This might appear unintuitive at first but is actually a nice trick: Assume we are running
 				// a shell session in a container and put a process in the background that is writing to
 				// stdout. Now assume the attached process (aka the shell in this example) exits because we
@@ -632,7 +629,6 @@ func ExecReaderToChannel(r io.Reader, bufferSize int, exited <-chan bool, fd int
 				// handled and triggers another codepath. (See [2].)"
 				if avoidAtomicLoad || atomic.LoadInt32(&attachedChildIsDead) == 1 {
 					avoidAtomicLoad = true
-					// COMMENT(brauner):
 					// Handle race between atomic.StorInt32() in the go routine
 					// explained in [1] and atomic.LoadInt32() in the go routine
 					// here:
@@ -681,7 +677,6 @@ func ExecReaderToChannel(r io.Reader, bufferSize int, exited <-chan bool, fd int
 				nr, err = r.Read(read)
 			}
 
-			// COMMENT(brauner):
 			// The attached process has exited and we have read all data that may have
 			// been buffered.
 			if ((revents & (POLLHUP | POLLRDHUP)) > 0) && !both {
@@ -699,4 +694,85 @@ func ExecReaderToChannel(r io.Reader, bufferSize int, exited <-chan bool, fd int
 	}()
 
 	return ch
+}
+
+var ObjectFound = fmt.Errorf("Found requested object.")
+
+func LookupUUIDByBlockDevPath(diskDevice string) (string, error) {
+	uuid := ""
+	readUUID := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if (info.Mode() & os.ModeSymlink) == os.ModeSymlink {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+
+			// filepath.Join() will call Clean() on the result and
+			// thus resolve those ugly "../../" parts that make it
+			// hard to compare the strings.
+			absPath := filepath.Join("/dev/disk/by-uuid", link)
+			if absPath == diskDevice {
+				uuid = path
+				// Will allows us to avoid needlessly travers
+				// the whole directory.
+				return ObjectFound
+			}
+		}
+		return nil
+	}
+
+	err := filepath.Walk("/dev/disk/by-uuid", readUUID)
+	if err != nil && err != ObjectFound {
+		return "", fmt.Errorf("Failed to detect UUID: %s.", err)
+	}
+
+	if uuid == "" {
+		return "", fmt.Errorf("Failed to detect UUID.")
+	}
+
+	lastSlash := strings.LastIndex(uuid, "/")
+	return uuid[lastSlash+1:], nil
+}
+
+func LookupBlockDevByUUID(uuid string) (string, error) {
+	detectedPath := ""
+	readPath := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if (info.Mode() & os.ModeSymlink) == os.ModeSymlink {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+
+			if info.Name() == uuid {
+				// filepath.Join() will call Clean() on the
+				// result and thus resolve those ugly "../../"
+				// parts that make it hard to compare the
+				// strings.
+				detectedPath = filepath.Join("/dev/disk/by-uuid", link)
+				// Will allows us to avoid needlessly travers
+				// the whole directory.
+				return ObjectFound
+			}
+		}
+		return nil
+	}
+
+	err := filepath.Walk("/dev/disk/by-uuid", readPath)
+	if err != nil && err != ObjectFound {
+		return "", fmt.Errorf("Failed to detect disk device: %s.", err)
+	}
+
+	if detectedPath == "" {
+		return "", fmt.Errorf("Failed to detect disk device.")
+	}
+
+	return detectedPath, nil
 }

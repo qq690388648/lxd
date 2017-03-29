@@ -278,6 +278,15 @@ func NewClientFromInfo(info ConnectInfo) (*Client, error) {
 		},
 	}
 	c.Name = info.Name
+
+	// Setup redirect policy
+	c.Http.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// Replicate the headers
+		req.Header = via[len(via)-1].Header
+
+		return nil
+	}
+
 	var err error
 	if strings.HasPrefix(info.RemoteConfig.Addr, "unix:") {
 		err = connectViaUnix(c, &info.RemoteConfig)
@@ -1095,7 +1104,7 @@ func (c *Client) PostImage(imageFile string, rootfsFile string, properties []str
 
 func (c *Client) GetImageInfo(image string) (*api.Image, error) {
 	if c.Remote.Protocol == "simplestreams" && c.simplestreams != nil {
-		return c.simplestreams.GetImageInfo(image)
+		return c.simplestreams.GetImage(image)
 	}
 
 	resp, err := c.get(fmt.Sprintf("images/%s", image))
@@ -1253,7 +1262,12 @@ func (c *Client) IsAlias(alias string) (bool, error) {
 
 func (c *Client) GetAlias(alias string) string {
 	if c.Remote.Protocol == "simplestreams" && c.simplestreams != nil {
-		return c.simplestreams.GetAlias(alias)
+		alias, err := c.simplestreams.GetAlias(alias)
+		if err != nil {
+			return ""
+		}
+
+		return alias.Target
 	}
 
 	resp, err := c.get(fmt.Sprintf("images/aliases/%s", alias))
@@ -1417,15 +1431,16 @@ func (c *Client) Init(name string, imgremote string, image string, profiles *[]s
 	return resp, nil
 }
 
-func (c *Client) LocalCopy(source string, name string, config map[string]string, profiles []string, ephemeral bool) (*api.Response, error) {
+func (c *Client) LocalCopy(source string, name string, config map[string]string, profiles []string, ephemeral bool, containerOnly bool) (*api.Response, error) {
 	if c.Remote.Public {
 		return nil, fmt.Errorf("This function isn't supported by public remotes.")
 	}
 
 	body := shared.Jmap{
 		"source": shared.Jmap{
-			"type":   "copy",
-			"source": source,
+			"type":           "copy",
+			"source":         source,
+			"container_only": containerOnly,
 		},
 		"name":      name,
 		"config":    config,
@@ -1855,7 +1870,12 @@ func (c *Client) RecursivePushFile(container string, source string, target strin
 
 	sendFile := func(p string, fInfo os.FileInfo, err error) error {
 		if err != nil {
-			return fmt.Errorf("got error sending path %s: %s", p, err)
+			return fmt.Errorf("Failed to walk path for %s: %s", p, err)
+		}
+
+		// Detect symlinks
+		if !fInfo.Mode().IsRegular() && !fInfo.Mode().IsDir() {
+			return fmt.Errorf("'%s' isn't a regular file or directory.", p)
 		}
 
 		appendLen := len(sourceDir)
@@ -1883,7 +1903,7 @@ func (c *Client) RecursivePushFile(container string, source string, target strin
 	return filepath.Walk(source, sendFile)
 }
 
-func (c *Client) PullFile(container string, p string) (int, int, int, string, io.ReadCloser, []string, error) {
+func (c *Client) PullFile(container string, p string) (int64, int64, int, string, io.ReadCloser, []string, error) {
 	if c.Remote.Public {
 		return 0, 0, 0, "", nil, nil, fmt.Errorf("This function isn't supported by public remotes.")
 	}
@@ -1896,7 +1916,7 @@ func (c *Client) PullFile(container string, p string) (int, int, int, string, io
 		return 0, 0, 0, "", nil, nil, err
 	}
 
-	uid, gid, mode, type_ := shared.ParseLXDFileHeaders(r.Header)
+	uid, gid, mode, type_, _ := shared.ParseLXDFileHeaders(r.Header)
 	if type_ == "directory" {
 		resp, err := HoistResponse(r, api.SyncResponse)
 		if err != nil {
@@ -1962,12 +1982,28 @@ func (c *Client) RecursivePullFile(container string, p string, targetDir string)
 	return nil
 }
 
-func (c *Client) GetMigrationSourceWS(container string) (*api.Response, error) {
+func (c *Client) DeleteFile(container string, p string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	query := url.Values{"path": []string{p}}
+	_, err := c.delete(fmt.Sprintf("containers/%s/files?%s", container, query.Encode()), nil, api.SyncResponse)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) GetMigrationSourceWS(container string, stateful bool, containerOnly bool) (*api.Response, error) {
 	if c.Remote.Public {
 		return nil, fmt.Errorf("This function isn't supported by public remotes.")
 	}
 
-	body := shared.Jmap{"migration": true}
+	body := shared.Jmap{
+		"migration": true,
+		"live":      stateful}
 	url := fmt.Sprintf("containers/%s", container)
 	if shared.IsSnapshot(container) {
 		pieces := strings.SplitN(container, shared.SnapshotDelimiter, 2)
@@ -1976,6 +2012,8 @@ func (c *Client) GetMigrationSourceWS(container string) (*api.Response, error) {
 		}
 
 		url = fmt.Sprintf("containers/%s/snapshots/%s", pieces[0], pieces[1])
+	} else {
+		body["container_only"] = containerOnly
 	}
 
 	return c.post(url, body, api.AsyncResponse)
@@ -1985,14 +2023,15 @@ func (c *Client) MigrateFrom(name string, operation string, certificate string,
 	sourceSecrets map[string]string, architecture string, config map[string]string,
 	devices map[string]map[string]string, profiles []string,
 	baseImage string, ephemeral bool, push bool, sourceClient *Client,
-	sourceOperation string) (*api.Response, error) {
+	sourceOperation string, containerOnly bool) (*api.Response, error) {
 	if c.Remote.Public {
 		return nil, fmt.Errorf("This function isn't supported by public remotes.")
 	}
 
 	source := shared.Jmap{
-		"type":       "migration",
-		"base-image": baseImage,
+		"type":           "migration",
+		"base-image":     baseImage,
+		"container_only": containerOnly,
 	}
 
 	if push {
@@ -2190,8 +2229,16 @@ func (c *Client) WaitFor(waitURL string) (*api.Operation, error) {
 	 * "/<version>/operations/" in it; we chop off the leading / and pass
 	 * it to url directly.
 	 */
-	shared.LogDebugf(path.Join(waitURL[1:], "wait"))
 	resp, err := c.baseGet(c.url(waitURL, "wait"))
+	if err != nil {
+		return nil, err
+	}
+
+	return resp.MetadataAsOperation()
+}
+
+func (c *Client) GetOperation(url string) (*api.Operation, error) {
+	resp, err := c.baseGet(c.url(url))
 	if err != nil {
 		return nil, err
 	}
@@ -2800,4 +2847,148 @@ func (c *Client) ListNetworks() ([]api.Network, error) {
 	}
 
 	return networks, nil
+}
+
+// Storage functions
+func (c *Client) ListStoragePools() ([]api.StoragePool, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	resp, err := c.get("storage-pools?recursion=1")
+	if err != nil {
+		return nil, err
+	}
+
+	pools := []api.StoragePool{}
+	if err := json.Unmarshal(resp.Metadata, &pools); err != nil {
+		return nil, err
+	}
+
+	return pools, nil
+}
+
+func (c *Client) StoragePoolCreate(name string, driver string, config map[string]string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	body := shared.Jmap{"name": name, "driver": driver, "config": config}
+
+	_, err := c.post("storage-pools", body, api.SyncResponse)
+	return err
+}
+
+func (c *Client) StoragePoolDelete(name string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	_, err := c.delete(fmt.Sprintf("storage-pools/%s", name), nil, api.SyncResponse)
+	return err
+}
+
+func (c *Client) StoragePoolGet(name string) (api.StoragePool, error) {
+	if c.Remote.Public {
+		return api.StoragePool{}, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	resp, err := c.get(fmt.Sprintf("storage-pools/%s", name))
+	if err != nil {
+		return api.StoragePool{}, err
+	}
+
+	pools := api.StoragePool{}
+	if err := json.Unmarshal(resp.Metadata, &pools); err != nil {
+		return api.StoragePool{}, err
+	}
+
+	return pools, nil
+}
+
+func (c *Client) StoragePoolPut(name string, pool api.StoragePool) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	if pool.Name != name {
+		return fmt.Errorf("Cannot change storage pool name")
+	}
+
+	_, err := c.put(fmt.Sprintf("storage-pools/%s", name), pool, api.SyncResponse)
+	return err
+}
+
+// /1.0/storage-pools/{name}/volumes
+func (c *Client) StoragePoolVolumesList(pool string) ([]api.StorageVolume, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	resp, err := c.get(fmt.Sprintf("storage-pools/%s/volumes?recursion=1", pool))
+	if err != nil {
+		return nil, err
+	}
+
+	volumes := []api.StorageVolume{}
+	if err := json.Unmarshal(resp.Metadata, &volumes); err != nil {
+		return nil, err
+	}
+
+	return volumes, nil
+}
+
+// /1.0/storage-pools/{pool}/volumes/{volume_type}
+func (c *Client) StoragePoolVolumeTypeCreate(pool string, volume string, volumeType string, config map[string]string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	body := shared.Jmap{"pool": pool, "name": volume, "type": volumeType, "config": config}
+
+	_, err := c.post(fmt.Sprintf("storage-pools/%s/volumes/%s", pool, volumeType), body, api.SyncResponse)
+	return err
+}
+
+// /1.0/storage-pools/{pool}/volumes/{type}/{name}
+func (c *Client) StoragePoolVolumeTypeGet(pool string, volume string, volumeType string) (api.StorageVolume, error) {
+	if c.Remote.Public {
+		return api.StorageVolume{}, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	resp, err := c.get(fmt.Sprintf("storage-pools/%s/volumes/%s/%s", pool, volumeType, volume))
+	if err != nil {
+		return api.StorageVolume{}, err
+	}
+
+	vol := api.StorageVolume{}
+	if err := json.Unmarshal(resp.Metadata, &vol); err != nil {
+		return api.StorageVolume{}, err
+	}
+
+	return vol, nil
+}
+
+// /1.0/storage-pools/{pool}/volumes/{type}/{name}
+func (c *Client) StoragePoolVolumeTypePut(pool string, volume string, volumeType string, volumeConfig api.StorageVolume) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	if volumeConfig.Name != volume {
+		return fmt.Errorf("Cannot change storage volume name")
+	}
+
+	_, err := c.put(fmt.Sprintf("storage-pools/%s/volumes/%s/%s", pool, volumeType, volume), volumeConfig, api.SyncResponse)
+	return err
+}
+
+// /1.0/storage-pools/{pool}/volumes/{type}/{name}
+func (c *Client) StoragePoolVolumeTypeDelete(pool string, volume string, volumeType string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	_, err := c.delete(fmt.Sprintf("storage-pools/%s/volumes/%s/%s", pool, volumeType, volume), nil, api.SyncResponse)
+	return err
 }

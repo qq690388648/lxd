@@ -13,29 +13,26 @@ TAGS=$(shell test -e /usr/include/sqlite3.h && echo "-tags libsqlite3")
 
 .PHONY: default
 default:
-	# Must a few times due to go get race
-	-go get -t -v -d ./...
-	-go get -t -v -d ./...
-	-go get -t -v -d ./...
+	go get -t -v -d ./...
 	go install -v $(TAGS) $(DEBUG) ./...
 	@echo "LXD built successfully"
 
 .PHONY: client
 client:
-	# Must a few times due to go get race
-	-go get -t -v -d ./...
-	-go get -t -v -d ./...
-	-go get -t -v -d ./...
+	go get -t -v -d ./...
 	go install -v $(TAGS) $(DEBUG) ./lxc
 	@echo "LXD client built successfully"
 
 .PHONY: update
 update:
-	# Must a few times due to go get race
-	-go get -t -v -d -u ./...
-	-go get -t -v -d -u ./...
 	go get -t -v -d -u ./...
 	@echo "Dependencies updated"
+
+.PHONY: debug
+debug:
+	go get -t -v -d ./...
+	go install -v $(TAGS) -tags logdebug $(DEBUG) ./...
+	@echo "LXD built successfully"
 
 # This only needs to be done when migrate.proto is actually changed; since we
 # commit the .pb.go in the tree and it's not expected to change very often,
@@ -48,6 +45,7 @@ protobuf:
 check: default
 	go get -v -x github.com/rogpeppe/godeps
 	go get -v -x github.com/remyoudompheng/go-misc/deadcode
+	go get -v -x github.com/golang/lint/golint
 	go test -v $(TAGS) $(DEBUG) ./...
 	cd test && ./main.sh
 
@@ -67,10 +65,10 @@ dist:
 	ln -s ../../../../lxd-$(VERSION) $(TMP)/dist/src/github.com/lxc/lxd
 	
 	# Download dependencies
-	-cd $(TMP)/lxd-$(VERSION) && GOPATH=$(TMP)/dist go get -t -v -d ./...
-	-cd $(TMP)/lxd-$(VERSION) && GOPATH=$(TMP)/dist go get -t -v -d ./...
-	-cd $(TMP)/lxd-$(VERSION) && GOPATH=$(TMP)/dist go get -t -v -d ./...
 	cd $(TMP)/lxd-$(VERSION) && GOPATH=$(TMP)/dist go get -t -v -d ./...
+	
+	# Workaround for gorilla/mux on Go < 1.7
+	cd $(TMP)/lxd-$(VERSION) && GOPATH=$(TMP)/dist go get -v -d github.com/gorilla/context
 	
 	# Assemble tarball
 	rm $(TMP)/dist/src/github.com/lxc/lxd
@@ -91,7 +89,7 @@ po/%.po: po/$(DOMAIN).pot
 	msgmerge -U po/$*.po po/$(DOMAIN).pot
 
 update-po:
-	-for lang in $(LINGUAS); do\
+	for lang in $(LINGUAS); do\
 	    msgmerge -U $$lang.po po/$(DOMAIN).pot; \
 	    rm -f $$lang.po~; \
 	done

@@ -218,7 +218,7 @@ test_basic_usage() {
   # Test activateifneeded/shutdown
   LXD_ACTIVATION_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_ACTIVATION_DIR}"
-  spawn_lxd "${LXD_ACTIVATION_DIR}"
+  spawn_lxd "${LXD_ACTIVATION_DIR}" true
   (
     set -e
     # shellcheck disable=SC2030
@@ -237,17 +237,13 @@ test_basic_usage() {
 
     lxc start autostart --force-local
     PID=$(lxc info autostart --force-local | grep ^Pid | awk '{print $2}')
-    lxd shutdown
+    shutdown_lxd "${LXD_DIR}"
     [ -d "/proc/${PID}" ] && false
 
     lxd activateifneeded --debug 2>&1 | grep -q "Daemon has auto-started containers, activating..."
 
-    # shellcheck disable=SC2086
-    lxd --logfile "${LXD_DIR}/lxd.log" ${DEBUG-} "$@" 2>&1 &
-    LXD_PID=$!
-    echo "${LXD_PID}" > "${LXD_DIR}/lxd.pid"
-    echo "${LXD_DIR}" >> "${TEST_DIR}/daemons"
-    lxd waitready --timeout=300
+    # shellcheck disable=SC2031
+    respawn_lxd "${LXD_DIR}"
 
     lxc list --force-local autostart | grep -q RUNNING
 
@@ -369,7 +365,7 @@ test_basic_usage() {
   # make sure that privileged containers are not world-readable
   lxc profile create unconfined
   lxc profile set unconfined security.privileged true
-  lxc init testimage foo2 -p unconfined
+  lxc init testimage foo2 -p unconfined -s "lxdtest-$(basename "${LXD_DIR}")"
   [ "$(stat -L -c "%a" "${LXD_DIR}/containers/foo2")" = "700" ]
   lxc delete foo2
   lxc profile delete unconfined
@@ -409,7 +405,7 @@ test_basic_usage() {
   REBOOTED="false"
 
   # shellcheck disable=SC2034
-  for i in $(seq 10); do
+  for i in $(seq 20); do
     NEW_INIT=$(lxc info foo | grep ^Pid || true)
 
     if [ -n "${NEW_INIT}" ] && [ "${OLD_INIT}" != "${NEW_INIT}" ]; then

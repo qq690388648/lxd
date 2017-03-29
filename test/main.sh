@@ -68,6 +68,9 @@ spawn_lxd() {
   lxddir=${1}
   shift
 
+  storage=${1}
+  shift
+
   # Copy pre generated Certs
   cp deps/server.crt "${lxddir}"
   cp deps/server.key "${lxddir}"
@@ -109,8 +112,32 @@ spawn_lxd() {
     LXD_DIR="${lxddir}" lxc network attach-profile lxdbr0 default eth0
   fi
 
-  echo "==> Configuring storage backend"
-  "$LXD_BACKEND"_configure "${lxddir}"
+  if [ "${storage}" = true ]; then
+    echo "==> Configuring storage backend"
+    "$LXD_BACKEND"_configure "${lxddir}"
+  fi
+}
+
+respawn_lxd() {
+  set +x
+  # LXD_DIR is local here because since $(lxc) is actually a function, it
+  # overwrites the environment and we would lose LXD_DIR's value otherwise.
+
+  # shellcheck disable=2039
+  local LXD_DIR
+
+  lxddir=${1}
+  shift
+
+  echo "==> Spawning lxd in ${lxddir}"
+  # shellcheck disable=SC2086
+  LXD_DIR="${lxddir}" lxd --logfile "${lxddir}/lxd.log" ${DEBUG-} "$@" 2>&1 &
+  LXD_PID=$!
+  echo "${LXD_PID}" > "${lxddir}/lxd.pid"
+  echo "==> Spawned LXD (PID is ${LXD_PID})"
+
+  echo "==> Confirming lxd is responsive"
+  LXD_DIR="${lxddir}" lxd waitready --timeout=300
 }
 
 lxc() {
@@ -247,6 +274,11 @@ kill_lxd() {
       lxc profile delete "${profile}" --force-local || true
     done
 
+    echo "==> Deleting all storage pools"
+    for storage in $(lxc storage list --force-local | tail -n+3 | grep "^| " | cut -d' ' -f2); do
+      lxc storage delete "${storage}" --force-local || true
+    done
+
     echo "==> Checking for locked DB tables"
     for table in $(echo .tables | sqlite3 "${daemon_dir}/lxd.db"); do
       echo "SELECT * FROM ${table};" | sqlite3 "${daemon_dir}/lxd.db" >/dev/null
@@ -257,6 +289,7 @@ kill_lxd() {
 
     # Cleanup shmounts (needed due to the forceful kill)
     find "${daemon_dir}" -name shmounts -exec "umount" "-l" "{}" \; >/dev/null 2>&1 || true
+    find "${daemon_dir}" -name devlxd -exec "umount" "-l" "{}" \; >/dev/null 2>&1 || true
 
     check_leftovers="true"
   fi
@@ -299,6 +332,10 @@ kill_lxd() {
     check_empty_table "${daemon_dir}/lxd.db" "profiles_config"
     check_empty_table "${daemon_dir}/lxd.db" "profiles_devices"
     check_empty_table "${daemon_dir}/lxd.db" "profiles_devices_config"
+    check_empty_table "${daemon_dir}/lxd.db" "storage_pools"
+    check_empty_table "${daemon_dir}/lxd.db" "storage_pools_config"
+    check_empty_table "${daemon_dir}/lxd.db" "storage_volumes"
+    check_empty_table "${daemon_dir}/lxd.db" "storage_volumes_config"
   fi
 
   # teardown storage
@@ -309,6 +346,22 @@ kill_lxd() {
 
   # Remove the daemon from the list
   sed "\|^${daemon_dir}|d" -i "${TEST_DIR}/daemons"
+}
+
+shutdown_lxd() {
+  # LXD_DIR is local here because since $(lxc) is actually a function, it
+  # overwrites the environment and we would lose LXD_DIR's value otherwise.
+
+  # shellcheck disable=2039
+  local LXD_DIR
+
+  daemon_dir=${1}
+  LXD_DIR=${daemon_dir}
+  daemon_pid=$(cat "${daemon_dir}/lxd.pid")
+  echo "==> Killing LXD at ${daemon_dir}"
+
+  # Kill the daemon
+  lxd shutdown || kill -9 "${daemon_pid}" 2>/dev/null || true
 }
 
 cleanup() {
@@ -368,7 +421,7 @@ wipe() {
 
   # shellcheck disable=SC2009
   ps aux | grep lxc-monitord | grep "${1}" | awk '{print $2}' | while read -r pid; do
-    kill -9 "${pid}"
+    kill -9 "${pid}" || true
   done
 
   if [ -f "${TEST_DIR}/loops" ]; then
@@ -381,6 +434,60 @@ wipe() {
   fi
 
   rm -Rf "${1}"
+}
+
+configure_loop_device() {
+  lv_loop_file=$(mktemp -p "${TEST_DIR}" XXXX.img)
+  truncate -s 10G "${lv_loop_file}"
+  pvloopdev=$(losetup --show -f "${lv_loop_file}")
+  if [ ! -e "${pvloopdev}" ]; then
+    echo "failed to setup loop"
+    false
+  fi
+  echo "${pvloopdev}" >> "${TEST_DIR}/loops"
+
+  # The following code enables to return a value from a shell function by
+  # calling the function as: fun VAR1
+
+  # shellcheck disable=2039
+  local  __tmp1="${1}"
+  # shellcheck disable=2039
+  local  res1="${lv_loop_file}"
+  if [ "${__tmp1}" ]; then
+      eval "${__tmp1}='${res1}'"
+  fi
+
+  # shellcheck disable=2039
+  local  __tmp2="${2}"
+  # shellcheck disable=2039
+  local  res2="${pvloopdev}"
+  if [ "${__tmp2}" ]; then
+      eval "${__tmp2}='${res2}'"
+  fi
+}
+
+deconfigure_loop_device() {
+  lv_loop_file="${1}"
+  loopdev="${2}"
+
+  SUCCESS=0
+  # shellcheck disable=SC2034
+  for i in $(seq 10); do
+    if losetup -d "${loopdev}"; then
+      SUCCESS=1
+      break
+    fi
+
+    sleep 0.5
+  done
+
+  if [ "${SUCCESS}" = "0" ]; then
+    echo "Failed to tear down loop device"
+    false
+  fi
+
+  rm -f "${lv_loop_file}"
+  sed -i "\|^${loopdev}|d" "${TEST_DIR}/loops"
 }
 
 # Must be set before cleanup()
@@ -410,14 +517,14 @@ export LXD_CONF
 LXD_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
 export LXD_DIR
 chmod +x "${LXD_DIR}"
-spawn_lxd "${LXD_DIR}"
+spawn_lxd "${LXD_DIR}" true
 LXD_ADDR=$(cat "${LXD_DIR}/lxd.addr")
 export LXD_ADDR
 
 # Setup the second LXD
 LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
 chmod +x "${LXD2_DIR}"
-spawn_lxd "${LXD2_DIR}"
+spawn_lxd "${LXD2_DIR}" true
 LXD2_ADDR=$(cat "${LXD2_DIR}/lxd.addr")
 export LXD2_ADDR
 
@@ -427,8 +534,11 @@ run_test() {
   TEST_CURRENT_DESCRIPTION=${2:-${1}}
 
   echo "==> TEST BEGIN: ${TEST_CURRENT_DESCRIPTION}"
+  START_TIME=$(date +%s)
   ${TEST_CURRENT}
-  echo "==> TEST DONE: ${TEST_CURRENT_DESCRIPTION}"
+  END_TIME=$(date +%s)
+
+  echo "==> TEST DONE: ${TEST_CURRENT_DESCRIPTION} ($((END_TIME-START_TIME))s)"
 }
 
 # allow for running a specific set of tests
@@ -441,7 +551,7 @@ fi
 run_test test_check_deps "checking dependencies"
 run_test test_static_analysis "static analysis"
 run_test test_database_update "database schema updates"
-run_test test_remote_url "remote  url handling"
+run_test test_remote_url "remote url handling"
 run_test test_remote_admin "remote administration"
 run_test test_remote_usage "remote usage"
 run_test test_basic_usage "basic usage"
@@ -464,5 +574,9 @@ run_test test_migration "migration"
 run_test test_fdleak "fd leak"
 run_test test_cpu_profiling "CPU profiling"
 run_test test_mem_profiling "memory profiling"
+run_test test_storage "storage"
+run_test test_lxd_autoinit "lxd init auto"
+run_test test_storage_profiles "storage profiles"
+run_test test_container_import "container import"
 
 TEST_RESULT=success

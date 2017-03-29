@@ -1,3 +1,5 @@
+// +build !logdebug
+
 package shared
 
 import (

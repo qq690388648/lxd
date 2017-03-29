@@ -44,6 +44,11 @@ var api10 = []Command{
 	certificateFingerprintCmd,
 	profilesCmd,
 	profileCmd,
+	storagePoolsCmd,
+	storagePoolCmd,
+	storagePoolVolumesCmd,
+	storagePoolVolumesTypeCmd,
+	storagePoolVolumeTypeCmd,
 }
 
 func api10Get(d *Daemon, r *http.Request) Response {
@@ -84,6 +89,17 @@ func api10Get(d *Daemon, r *http.Request) Response {
 			"id_map",
 			"network_firewall_filtering",
 			"network_routes",
+			"storage",
+			"file_delete",
+			"file_append",
+			"network_dhcp_expiry",
+			"storage_lvm_vg_rename",
+			"storage_lvm_thinpool_rename",
+			"network_vlan",
+			"image_create_aliases",
+			"container_stateless_copy",
+			"container_only_migration",
+			"storage_zfs_clone_copy",
 		},
 		APIStatus:  "stable",
 		APIVersion: version.APIVersion,
@@ -163,11 +179,32 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		Kernel:             kernel,
 		KernelArchitecture: kernelArchitecture,
 		KernelVersion:      kernelVersion,
-		Storage:            d.Storage.GetStorageTypeName(),
-		StorageVersion:     d.Storage.GetStorageTypeVersion(),
 		Server:             "lxd",
 		ServerPid:          os.Getpid(),
 		ServerVersion:      version.Version}
+
+	drivers := readStoragePoolDriversCache()
+	for _, driver := range drivers {
+		// Initialize a core storage interface for the given driver.
+		sCore, err := storageCoreInit(driver)
+		if err != nil {
+			continue
+		}
+
+		if env.Storage != "" {
+			env.Storage = env.Storage + " | " + driver
+		} else {
+			env.Storage = driver
+		}
+
+		// Get the version of the storage drivers in use.
+		sVersion := sCore.GetStorageTypeVersion()
+		if env.StorageVersion != "" {
+			env.StorageVersion = env.StorageVersion + " | " + sVersion
+		} else {
+			env.StorageVersion = sVersion
+		}
+	}
 
 	fullSrv := api.Server{ServerUntrusted: srv}
 	fullSrv.Environment = env

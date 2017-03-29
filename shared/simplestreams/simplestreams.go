@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,10 @@ func (a ssSortImage) Less(i, j int) bool {
 
 			if !shared.TimeIsSet(a[j].CreatedAt) {
 				return false
+			}
+
+			if a[i].CreatedAt == a[j].CreatedAt {
+				return a[i].Properties["serial"] > a[j].Properties["serial"]
 			}
 
 			return a[i].CreatedAt.UTC().Unix() > a[j].CreatedAt.UTC().Unix()
@@ -133,8 +138,10 @@ func (s *SimpleStreamsManifest) ToLXD() ([]api.Image, map[string][][]string) {
 
 			metaPath := meta.Path
 			metaHash := meta.HashSha256
+			metaSize := meta.Size
 			rootfsPath := ""
 			rootfsHash := ""
+			rootfsSize := int64(0)
 			fields := strings.Split(meta.Path, "/")
 			filename := fields[len(fields)-1]
 			size := meta.Size
@@ -149,6 +156,7 @@ func (s *SimpleStreamsManifest) ToLXD() ([]api.Image, map[string][][]string) {
 				size += rootSquash.Size
 				rootfsPath = rootSquash.Path
 				rootfsHash = rootSquash.HashSha256
+				rootfsSize = rootSquash.Size
 			} else {
 				if meta.LXDHashSha256RootXz != "" {
 					fingerprint = meta.LXDHashSha256RootXz
@@ -158,6 +166,7 @@ func (s *SimpleStreamsManifest) ToLXD() ([]api.Image, map[string][][]string) {
 				size += rootTar.Size
 				rootfsPath = rootTar.Path
 				rootfsHash = rootTar.HashSha256
+				rootfsSize = rootTar.Size
 			}
 
 			if size == 0 || filename == "" || fingerprint == "" {
@@ -214,7 +223,9 @@ func (s *SimpleStreamsManifest) ToLXD() ([]api.Image, map[string][][]string) {
 				}
 			}
 
-			downloads[fingerprint] = [][]string{{metaPath, metaHash, "meta"}, {rootfsPath, rootfsHash, "root"}}
+			downloads[fingerprint] = [][]string{
+				{metaPath, metaHash, "meta", fmt.Sprintf("%d", metaSize)},
+				{rootfsPath, rootfsHash, "root", fmt.Sprintf("%d", rootfsSize)}}
 			images = append(images, image)
 		}
 	}
@@ -265,6 +276,12 @@ type SimpleStreamsIndexStream struct {
 	Products []string `json:"products"`
 }
 
+type SimpleStreamsFile struct {
+	Path   string
+	Sha256 string
+	Size   int64
+}
+
 func NewClient(url string, httpClient http.Client, useragent string) *SimpleStreams {
 	return &SimpleStreams{
 		http:           &httpClient,
@@ -290,7 +307,8 @@ func (s *SimpleStreams) parseIndex() (*SimpleStreamsIndex, error) {
 		return s.cachedIndex, nil
 	}
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/streams/v1/index.json", s.url), nil)
+	url := fmt.Sprintf("%s/streams/v1/index.json", s.url)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +322,10 @@ func (s *SimpleStreams) parseIndex() (*SimpleStreamsIndex, error) {
 		return nil, err
 	}
 	defer r.Body.Close()
+
+	if r.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Unable to fetch %s: %s", url, r.Status)
+	}
 
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -327,7 +349,8 @@ func (s *SimpleStreams) parseManifest(path string) (*SimpleStreamsManifest, erro
 		return s.cachedManifest[path], nil
 	}
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/%s", s.url, path), nil)
+	url := fmt.Sprintf("%s/%s", s.url, path)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -341,6 +364,10 @@ func (s *SimpleStreams) parseManifest(path string) (*SimpleStreamsManifest, erro
 		return nil, err
 	}
 	defer r.Body.Close()
+
+	if r.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Unable to fetch %s: %s", url, r.Status)
+	}
 
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -470,7 +497,7 @@ func (s *SimpleStreams) getImages() ([]api.Image, map[string]*api.ImageAliasesEn
 	return images, aliases, nil
 }
 
-func (s *SimpleStreams) getPaths(fingerprint string) ([][]string, error) {
+func (s *SimpleStreams) GetFiles(fingerprint string) (map[string]SimpleStreamsFile, error) {
 	// Load the main index
 	ssIndex, err := s.parseIndex()
 	if err != nil {
@@ -498,11 +525,21 @@ func (s *SimpleStreams) getPaths(fingerprint string) ([][]string, error) {
 
 		for _, image := range manifestImages {
 			if strings.HasPrefix(image.Fingerprint, fingerprint) {
-				urls := [][]string{}
+				files := map[string]SimpleStreamsFile{}
+
 				for _, path := range downloads[image.Fingerprint] {
-					urls = append(urls, []string{path[0], path[1], path[2]})
+					size, err := strconv.ParseInt(path[3], 10, 64)
+					if err != nil {
+						return nil, err
+					}
+
+					files[path[2]] = SimpleStreamsFile{
+						Path:   path[0],
+						Sha256: path[1],
+						Size:   size}
 				}
-				return urls, nil
+
+				return files, nil
 			}
 		}
 	}
@@ -527,20 +564,20 @@ func (s *SimpleStreams) downloadFile(path string, hash string, target string, pr
 			req.Header.Set("User-Agent", s.useragent)
 		}
 
-		resp, err := s.http.Do(req)
+		r, err := s.http.Do(req)
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer r.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("invalid simplestreams source: got %d looking for %s", resp.StatusCode, path)
+		if r.StatusCode != http.StatusOK {
+			return fmt.Errorf("Unable to fetch %s: %s", url, r.Status)
 		}
 
 		body := &ioprogress.ProgressReader{
-			ReadCloser: resp.Body,
+			ReadCloser: r.Body,
 			Tracker: &ioprogress.ProgressTracker{
-				Length:  resp.ContentLength,
+				Length:  r.ContentLength,
 				Handler: progress,
 			},
 		}
@@ -596,33 +633,41 @@ func (s *SimpleStreams) ListImages() ([]api.Image, error) {
 	return images, err
 }
 
-func (s *SimpleStreams) GetAlias(name string) string {
+func (s *SimpleStreams) GetAlias(name string) (*api.ImageAliasesEntry, error) {
 	_, aliasesMap, err := s.getImages()
 	if err != nil {
-		return ""
+		return nil, err
 	}
 
 	alias, ok := aliasesMap[name]
 	if !ok {
-		return ""
+		return nil, fmt.Errorf("Alias '%s' doesn't exist", name)
 	}
 
-	return alias.Target
+	return alias, nil
 }
 
-func (s *SimpleStreams) GetImageInfo(fingerprint string) (*api.Image, error) {
+func (s *SimpleStreams) GetImage(fingerprint string) (*api.Image, error) {
 	images, _, err := s.getImages()
 	if err != nil {
 		return nil, err
 	}
 
+	matches := []api.Image{}
+
 	for _, image := range images {
 		if strings.HasPrefix(image.Fingerprint, fingerprint) {
-			return &image, nil
+			matches = append(matches, image)
 		}
 	}
 
-	return nil, fmt.Errorf("The requested image couldn't be found.")
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("The requested image couldn't be found.")
+	} else if len(matches) > 1 {
+		return nil, fmt.Errorf("More than one match for the provided partial fingerprint.")
+	}
+
+	return &matches[0], nil
 }
 
 func (s *SimpleStreams) ExportImage(image string, target string) (string, error) {
@@ -630,16 +675,16 @@ func (s *SimpleStreams) ExportImage(image string, target string) (string, error)
 		return "", fmt.Errorf("Split images can only be written to a directory.")
 	}
 
-	paths, err := s.getPaths(image)
+	files, err := s.GetFiles(image)
 	if err != nil {
 		return "", err
 	}
 
-	for _, path := range paths {
-		fields := strings.Split(path[0], "/")
+	for _, file := range files {
+		fields := strings.Split(file.Path, "/")
 		targetFile := filepath.Join(target, fields[len(fields)-1])
 
-		err := s.downloadFile(path[0], path[1], targetFile, nil)
+		err := s.downloadFile(file.Path, file.Sha256, targetFile, nil)
 		if err != nil {
 			return "", err
 		}
@@ -648,18 +693,15 @@ func (s *SimpleStreams) ExportImage(image string, target string) (string, error)
 	return target, nil
 }
 
-func (s *SimpleStreams) Download(image string, file string, target string, progress func(int64, int64)) error {
-	paths, err := s.getPaths(image)
+func (s *SimpleStreams) Download(image string, fileType string, target string, progress func(int64, int64)) error {
+	files, err := s.GetFiles(image)
 	if err != nil {
 		return err
 	}
 
-	for _, path := range paths {
-		if file != path[2] {
-			continue
-		}
-
-		return s.downloadFile(path[0], path[1], target, progress)
+	file, ok := files[fileType]
+	if ok {
+		return s.downloadFile(file.Path, file.Sha256, target, progress)
 	}
 
 	return fmt.Errorf("The file couldn't be found.")

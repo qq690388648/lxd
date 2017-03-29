@@ -11,7 +11,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -35,14 +34,14 @@ func networkAutoAttach(d *Daemon, devName string) error {
 
 func networkAttachInterface(netName string, devName string) error {
 	if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/bridge", netName)) {
-		err := shared.RunCommand("ip", "link", "set", devName, "master", netName)
+		_, err := shared.RunCommand("ip", "link", "set", devName, "master", netName)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := shared.RunCommand("ovs-vsctl", "port-to-br", devName)
+		_, err := shared.RunCommand("ovs-vsctl", "port-to-br", devName)
 		if err != nil {
-			err := shared.RunCommand("ovs-vsctl", "add-port", netName, devName)
+			_, err := shared.RunCommand("ovs-vsctl", "add-port", netName, devName)
 			if err != nil {
 				return err
 			}
@@ -54,14 +53,14 @@ func networkAttachInterface(netName string, devName string) error {
 
 func networkDetachInterface(netName string, devName string) error {
 	if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/bridge", netName)) {
-		err := shared.RunCommand("ip", "link", "set", devName, "nomaster")
+		_, err := shared.RunCommand("ip", "link", "set", devName, "nomaster")
 		if err != nil {
 			return err
 		}
 	} else {
-		err := shared.RunCommand("ovs-vsctl", "port-to-br", devName)
+		_, err := shared.RunCommand("ovs-vsctl", "port-to-br", devName)
 		if err == nil {
-			err := shared.RunCommand("ovs-vsctl", "del-port", netName, devName)
+			_, err := shared.RunCommand("ovs-vsctl", "del-port", netName, devName)
 			if err != nil {
 				return err
 			}
@@ -105,12 +104,52 @@ func networkIsInUse(c container, name string) bool {
 			continue
 		}
 
-		if d["parent"] == name {
+		if networkGetHostDevice(d["parent"], d["vlan"]) == name {
 			return true
 		}
 	}
 
 	return false
+}
+
+func networkGetHostDevice(parent string, vlan string) string {
+	// If no VLAN, just use the raw device
+	if vlan == "" {
+		return parent
+	}
+
+	// If no VLANs are configured, use the default pattern
+	defaultVlan := fmt.Sprintf("%s.%s", parent, vlan)
+	if !shared.PathExists("/proc/net/vlan/config") {
+		return defaultVlan
+	}
+
+	// Look for an existing VLAN
+	f, err := os.Open("/proc/net/vlan/config")
+	if err != nil {
+		return defaultVlan
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		// Only grab the lines we're interested in
+		s := strings.Split(scanner.Text(), "|")
+		if len(s) != 3 {
+			continue
+		}
+
+		vlanIface := strings.TrimSpace(s[0])
+		vlanId := strings.TrimSpace(s[1])
+		vlanParent := strings.TrimSpace(s[2])
+
+		if vlanParent == parent && vlanId == vlan {
+			return vlanIface
+		}
+	}
+
+	// Return the default pattern
+	return defaultVlan
 }
 
 func networkGetIP(subnet *net.IPNet, host int64) net.IP {
@@ -178,7 +217,7 @@ func networkPingSubnet(subnet *net.IPNet) bool {
 			cmd = "ping6"
 		}
 
-		_, err := exec.Command(cmd, "-n", "-q", ip.String(), "-c", "1", "-W", "1").CombinedOutput()
+		_, err := shared.RunCommand(cmd, "-n", "-q", ip.String(), "-c", "1", "-W", "1")
 		if err != nil {
 			// Remote didn't answer
 			return

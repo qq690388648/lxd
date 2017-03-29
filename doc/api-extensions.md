@@ -176,3 +176,74 @@ dnsmasq is enabled on the bridge.
 
 ## network\_routes
 Introduces "ipv4.routes" and "ipv6.routes" which allow routing additional subnets to a LXD bridge.
+
+## storage
+Storage management API for LXD.
+
+This includes:
+* GET /1.0/storage-pools
+* POST /1.0/storage-pools (see rest-api.md for details)
+
+* GET /1.0/storage-pools/<name> (see rest-api.md for details)
+* POST /1.0/storage-pools/<name> (see rest-api.md for details)
+* PUT /1.0/storage-pools/<name> (see rest-api.md for details)
+* PATCH /1.0/storage-pools/<name> (see rest-api.md for details)
+* DELETE /1.0/storage-pools/<name> (see rest-api.md for details)
+
+* GET /1.0/storage-pools/<name>/volumes (see rest-api.md for details)
+
+* GET /1.0/storage-pools/<name>/volumes/<volume_type> (see rest-api.md for details)
+* POST /1.0/storage-pools/<name>/volumes/<volume_type> (see rest-api.md for details)
+
+* GET /1.0/storage-pools/<pool>/volumes/<volume_type>/<name> (see rest-api.md for details)
+* POST /1.0/storage-pools/<pool>/volumes/<volume_type>/<name> (see rest-api.md for details)
+* PUT /1.0/storage-pools/<pool>/volumes/<volume_type>/<name> (see rest-api.md for details)
+* PATCH /1.0/storage-pools/<pool>/volumes/<volume_type>/<name> (see rest-api.md for details)
+* DELETE /1.0/storage-pools/<pool>/volumes/<volume_type>/<name> (see rest-api.md for details)
+
+- All storage configuration options (see configuration.md for details)
+
+## file\_delete
+Implements DELETE in /1.0/containers/\<name\>/files
+
+## file\_append
+Implements the X-LXD-write header which can be one of "overwrite" or "append".
+
+## network\_dhcp\_expiry
+Introduces "ipv4.dhcp.expiry" and "ipv6.dhcp.expiry" allowing to set the DHCP lease expiry time.
+
+## storage\_lvm\_vg\_rename
+Introduces the ability to rename a volume group by setting "storage.lvm.vg\_name".
+
+## storage\_lvm\_thinpool\_rename
+Introduces the ability to rename a thinpool name by setting "storage.thinpool\_name".
+
+## network\_vlan
+This adds a new "vlan" property to "macvlan" network devices.
+
+When set, this will instruct LXD to attach to the specified VLAN. LXD
+will look for an existing interface for that VLAN on the host. If one
+can't be found it will create one itself and then use that as the
+macvlan parent.
+
+## image\_create\_aliases
+Adds a new "aliases" field to POST /1.0/images allowing for aliases to
+be set at image creation/import time.
+
+## container\_stateless\_copy
+This introduces a new "live" attribute in POST /1.0/containers/NAME.
+Setting it to false tells LXD not to attempt running state transfer.
+
+## container\_only\_migration
+Introduces a new boolean "container\_only" attribute. When set to true only the
+container will be copied or moved.
+
+## storage\_zfs\_clone\_copy
+Introduces a new boolean "storage\_zfs\_clone\_copy" property for ZFS storage
+pools. When set to false copying a container will be done through zfs send and
+receive. This will make the target container independent of its source
+container thus avoiding the need to keep dependent snapshots in the ZFS pool
+around. However, this also entails less efficient storage usage for the
+affected pool.
+The default value for this property is true, i.e. space-efficient snapshots
+will be used unless explicitly set to "false".

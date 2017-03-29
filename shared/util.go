@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -122,13 +123,13 @@ func LogPath(path ...string) string {
 	return filepath.Join(items...)
 }
 
-func ParseLXDFileHeaders(headers http.Header) (uid int, gid int, mode int, type_ string) {
-	uid, err := strconv.Atoi(headers.Get("X-LXD-uid"))
+func ParseLXDFileHeaders(headers http.Header) (uid int64, gid int64, mode int, type_ string, write string) {
+	uid, err := strconv.ParseInt(headers.Get("X-LXD-uid"), 10, 64)
 	if err != nil {
 		uid = -1
 	}
 
-	gid, err = strconv.Atoi(headers.Get("X-LXD-gid"))
+	gid, err = strconv.ParseInt(headers.Get("X-LXD-gid"), 10, 64)
 	if err != nil {
 		gid = -1
 	}
@@ -151,7 +152,15 @@ func ParseLXDFileHeaders(headers http.Header) (uid int, gid int, mode int, type_
 		type_ = "file"
 	}
 
-	return uid, gid, mode, type_
+	write = headers.Get("X-LXD-write")
+	/* backwards compat: before "write" was introduced, we could only
+	 * overwrite files
+	 */
+	if write == "" {
+		write = "overwrite"
+	}
+
+	return uid, gid, mode, type_, write
 }
 
 func ReadToJSON(r io.Reader, req interface{}) error {
@@ -255,11 +264,13 @@ func WriteAllBuf(w io.Writer, buf *bytes.Buffer) error {
 // FileMove tries to move a file by using os.Rename,
 // if that fails it tries to copy the file and remove the source.
 func FileMove(oldPath string, newPath string) error {
-	if err := os.Rename(oldPath, newPath); err == nil {
+	err := os.Rename(oldPath, newPath)
+	if err == nil {
 		return nil
 	}
 
-	if err := FileCopy(oldPath, newPath); err != nil {
+	err = FileCopy(oldPath, newPath)
+	if err != nil {
 		return err
 	}
 
@@ -429,42 +440,6 @@ func IsTrue(value string) bool {
 	return false
 }
 
-func IsOnSharedMount(pathName string) (bool, error) {
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return false, err
-	}
-	defer file.Close()
-
-	absPath, err := filepath.Abs(pathName)
-	if err != nil {
-		return false, err
-	}
-
-	expPath, err := os.Readlink(absPath)
-	if err != nil {
-		expPath = absPath
-	}
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		rows := strings.Fields(line)
-
-		if rows[4] != expPath {
-			continue
-		}
-
-		if strings.HasPrefix(rows[6], "shared:") {
-			return true, nil
-		} else {
-			return false, nil
-		}
-	}
-
-	return false, nil
-}
-
 func IsBlockdev(fm os.FileMode) bool {
 	return ((fm&os.ModeDevice != 0) && (fm&os.ModeCharDevice == 0))
 }
@@ -480,12 +455,12 @@ func IsBlockdevPath(pathName string) bool {
 }
 
 func BlockFsDetect(dev string) (string, error) {
-	out, err := exec.Command("blkid", "-s", "TYPE", "-o", "value", dev).Output()
+	out, err := RunCommand("blkid", "-s", "TYPE", "-o", "value", dev)
 	if err != nil {
-		return "", fmt.Errorf("Failed to run blkid on: %s", dev)
+		return "", err
 	}
 
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }
 
 // DeepCopy copies src to dest by using encoding/gob so its not that fast.
@@ -651,15 +626,14 @@ func ParseByteSizeString(input string) (int64, error) {
 	}
 
 	if unicode.IsNumber(rune(input[len(input)-1])) {
-		// COMMENT(brauner): No suffix --> bytes.
+		// No suffix --> bytes.
 		suffixLen = 0
 	} else if (len(input) >= 2) && (input[len(input)-1] == 'B') && unicode.IsNumber(rune(input[len(input)-2])) {
-		// COMMENT(brauner): "B" suffix --> bytes.
+		// "B" suffix --> bytes.
 		suffixLen = 1
 	} else if strings.HasSuffix(input, " bytes") {
-		// COMMENT(brauner): Backward compatible behaviour in case we
-		// talk to a LXD that still uses GetByteSizeString() that
-		// returns "n bytes".
+		// Backward compatible behaviour in case we talk to a LXD that
+		// still uses GetByteSizeString() that returns "n bytes".
 		suffixLen = 6
 	} else if (len(input) < 3) && (suffixLen == 2) {
 		return -1, fmt.Errorf("Invalid value: %s", input)
@@ -679,7 +653,7 @@ func ParseByteSizeString(input string) (int64, error) {
 		return -1, fmt.Errorf("Invalid value: %d", valueInt)
 	}
 
-	// COMMENT(brauner): The value is already in bytes.
+	// The value is already in bytes.
 	if suffixLen != 2 {
 		return valueInt, nil
 	}
@@ -782,13 +756,29 @@ func RemoveDuplicatesFromString(s string, sep string) string {
 	return s
 }
 
-func RunCommand(name string, arg ...string) error {
+func RunCommand(name string, arg ...string) (string, error) {
 	output, err := exec.Command(name, arg...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Failed to run: %s %s: %s", name, strings.Join(arg, " "), strings.TrimSpace(string(output)))
+		return string(output), fmt.Errorf("Failed to run: %s %s: %s", name, strings.Join(arg, " "), strings.TrimSpace(string(output)))
 	}
 
-	return nil
+	return string(output), nil
+}
+
+func TryRunCommand(name string, arg ...string) (string, error) {
+	var err error
+	var output string
+
+	for i := 0; i < 20; i++ {
+		output, err = RunCommand(name, arg...)
+		if err == nil {
+			break
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return output, err
 }
 
 func TimeIsSet(ts time.Time) bool {
@@ -801,4 +791,12 @@ func TimeIsSet(ts time.Time) bool {
 	}
 
 	return true
+}
+
+func Round(x float64) int64 {
+	if x < 0 {
+		return int64(math.Ceil(x - 0.5))
+	}
+
+	return int64(math.Floor(x + 0.5))
 }

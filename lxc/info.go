@@ -23,13 +23,15 @@ func (c *infoCmd) showByDefault() bool {
 
 func (c *infoCmd) usage() string {
 	return i18n.G(
-		`List information on LXD servers and containers.
+		`Usage: lxc info [<remote>:][<container>] [--show-log]
 
-For a container:
-    lxc info [<remote:>]<container> [--show-log]
+Show container or server information.
 
-For a server:
-    lxc info [<remote:>]`)
+lxc info [<remote>:]<container> [--show-log]
+    For container information.
+
+lxc info [<remote>:]
+    For LXD server information.`)
 }
 
 func (c *infoCmd) flags() {
@@ -140,7 +142,7 @@ func (c *infoCmd) containerInfo(d *lxd.Client, name string, showLog bool) error 
 		}
 
 		if diskInfo != "" {
-			fmt.Println(i18n.G("  Disk usage:"))
+			fmt.Println(fmt.Sprintf("  %s", i18n.G("Disk usage:")))
 			fmt.Printf(diskInfo)
 		}
 
@@ -151,7 +153,7 @@ func (c *infoCmd) containerInfo(d *lxd.Client, name string, showLog bool) error 
 		}
 
 		if cpuInfo != "" {
-			fmt.Println(i18n.G("  CPU usage:"))
+			fmt.Println(fmt.Sprintf("  %s", i18n.G("CPU usage:")))
 			fmt.Printf(cpuInfo)
 		}
 
@@ -174,7 +176,7 @@ func (c *infoCmd) containerInfo(d *lxd.Client, name string, showLog bool) error 
 		}
 
 		if memoryInfo != "" {
-			fmt.Println(i18n.G("  Memory usage:"))
+			fmt.Println(fmt.Sprintf("  %s", i18n.G("Memory usage:")))
 			fmt.Printf(memoryInfo)
 		}
 
@@ -191,7 +193,7 @@ func (c *infoCmd) containerInfo(d *lxd.Client, name string, showLog bool) error 
 		}
 
 		if networkInfo != "" {
-			fmt.Println(i18n.G("  Network usage:"))
+			fmt.Println(fmt.Sprintf("  %s", i18n.G("Network usage:")))
 			fmt.Printf(networkInfo)
 		}
 	}

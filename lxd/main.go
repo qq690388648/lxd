@@ -26,12 +26,13 @@ var argPrintGoroutinesEvery = gnuflag.Int("print-goroutines-every", -1, "")
 var argStorageBackend = gnuflag.String("storage-backend", "", "")
 var argStorageCreateDevice = gnuflag.String("storage-create-device", "", "")
 var argStorageCreateLoop = gnuflag.Int64("storage-create-loop", -1, "")
-var argStoragePool = gnuflag.String("storage-pool", "", "")
+var argStorageDataset = gnuflag.String("storage-pool", "", "")
 var argSyslog = gnuflag.Bool("syslog", false, "")
 var argTimeout = gnuflag.Int("timeout", -1, "")
 var argTrustPassword = gnuflag.String("trust-password", "", "")
 var argVerbose = gnuflag.Bool("verbose", false, "")
 var argVersion = gnuflag.Bool("version", false, "")
+var argForce = gnuflag.Bool("force", false, "")
 
 // Global variables
 var debug bool
@@ -74,7 +75,7 @@ func run() error {
 		fmt.Printf("        Perform a clean shutdown of LXD and all running containers\n")
 		fmt.Printf("    waitready [--timeout=15]\n")
 		fmt.Printf("        Wait until LXD is ready to handle requests\n")
-		fmt.Printf("    import <container name>\n")
+		fmt.Printf("    import <container name> [--force]\n")
 		fmt.Printf("        Import a pre-existing container from storage\n")
 
 		fmt.Printf("\n\nCommon options:\n")

@@ -17,52 +17,7 @@ import (
 	"github.com/lxc/lxd/shared/osarch"
 )
 
-// Helper functions
-func containerPath(name string, isSnapshot bool) string {
-	if isSnapshot {
-		return shared.VarPath("snapshots", name)
-	}
 
-	return shared.VarPath("containers", name)
-}
-
-func containerValidName(name string) error {
-	if strings.Contains(name, shared.SnapshotDelimiter) {
-		return fmt.Errorf(
-			"The character '%s' is reserved for snapshots.",
-			shared.SnapshotDelimiter)
-	}
-
-	if !shared.ValidHostname(name) {
-		return fmt.Errorf("Container name isn't a valid hostname.")
-	}
-
-	return nil
-}
-
-func containerValidConfigKey(d *Daemon, key string, value string) error {
-	f, err := shared.ConfigKeyChecker(key)
-	if err != nil {
-		return err
-	}
-	if err = f(value); err != nil {
-		return err
-	}
-	if key == "raw.lxc" {
-		return lxcValidConfig(value)
-	}
-	if key == "security.syscalls.blacklist_compat" {
-		for _, arch := range d.architectures {
-			if arch == osarch.ARCH_64BIT_INTEL_X86 ||
-				arch == osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN ||
-				arch == osarch.ARCH_64BIT_POWERPC_BIG_ENDIAN {
-				return nil
-			}
-		}
-		return fmt.Errorf("security.syscalls.blacklist_compat isn't supported on this architecture")
-	}
-	return nil
-}
 
 func containerValidDeviceConfigKey(t, k string) bool {
 	if k == "type" {
@@ -79,6 +34,8 @@ func containerValidDeviceConfigKey(t, k string) bool {
 		case "minor":
 			return true
 		case "mode":
+			return true
+		case "source":
 			return true
 		case "path":
 			return true
@@ -208,54 +165,7 @@ func containerValidConfig(d *Daemon, config map[string]string, profile bool, exp
 
 	_, rawSeccomp := config["raw.seccomp"]
 	_, whitelist := config["security.syscalls.whitelist"]
-	_, blacklist := config["security.syscalls.blacklist"]
-	blacklistDefault := shared.IsTrue(config["security.syscalls.blacklist_default"])
-	blacklistCompat := shared.IsTrue(config["security.syscalls.blacklist_compat"])
 
-	if rawSeccomp && (whitelist || blacklist || blacklistDefault || blacklistCompat) {
-		return fmt.Errorf("raw.seccomp is mutually exclusive with security.syscalls*")
-	}
-
-	if whitelist && (blacklist || blacklistDefault || blacklistCompat) {
-		return fmt.Errorf("security.syscalls.whitelist is mutually exclusive with security.syscalls.blacklist*")
-	}
-
-	if expanded && (config["security.privileged"] == "" || !shared.IsTrue(config["security.privileged"])) && d.IdmapSet == nil {
-		return fmt.Errorf("LXD doesn't have a uid/gid allocation. In this mode, only privileged containers are supported.")
-	}
-
-	return nil
-}
-
-func isRootDiskDevice(device types.Device) bool {
-	if device["type"] == "disk" && device["path"] == "/" && device["source"] == "" {
-		return true
-	}
-
-	return false
-}
-
-func containerGetRootDiskDevice(devices types.Devices) (string, types.Device, error) {
-	var devName string
-	var dev types.Device
-
-	for n, d := range devices {
-		if isRootDiskDevice(d) {
-			if devName != "" {
-				return "", types.Device{}, fmt.Errorf("More than one root device found.")
-			}
-
-			devName = n
-			dev = d
-		}
-	}
-
-	if devName != "" {
-		return devName, dev, nil
-	}
-
-	return "", types.Device{}, fmt.Errorf("No root device could be found.")
-}
 
 func containerValidDevices(devices types.Devices, profile bool, expanded bool) error {
 	// Empty device list
@@ -329,16 +239,20 @@ func containerValidDevices(devices types.Devices, profile bool, expanded bool) e
 			}
 
 		} else if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
-			if m["path"] == "" {
+			if m["path"] == "" && m["path"] == "" {
 				return fmt.Errorf("Unix device entry is missing the required \"path\" property.")
 			}
 
 			if m["major"] == "" || m["minor"] == "" {
-				if !shared.PathExists(m["path"]) {
+				srcPath, exist := m["source"]
+				if !exist {
+					srcPath = m["path"]
+				}
+				if !shared.PathExists(srcPath) {
 					return fmt.Errorf("The device path doesn't exist on the host and major/minor wasn't specified.")
 				}
 
-				dType, _, _, err := deviceGetAttributes(m["path"])
+				dType, _, _, err := deviceGetAttributes(srcPath)
 				if err != nil {
 					return err
 				}
@@ -806,61 +720,3 @@ func containerCreateInternal(d *Daemon, args containerArgs) (container, error) {
 		return nil, err
 	}
 
-	return c, nil
-}
-
-func containerConfigureInternal(c container) error {
-	// Find the root device
-	_, rootDiskDevice, err := containerGetRootDiskDevice(c.ExpandedDevices())
-	if err != nil {
-		return err
-	}
-
-	if rootDiskDevice["size"] != "" {
-		size, err := shared.ParseByteSizeString(rootDiskDevice["size"])
-		if err != nil {
-			return err
-		}
-
-		// Storage is guaranteed to be ready.
-		err = c.Storage().ContainerSetQuota(c, size)
-		if err != nil {
-			return err
-		}
-	}
-
-	ourStart, err := c.StorageStart()
-	if err != nil {
-		return err
-	}
-	if ourStart {
-		defer c.StorageStop()
-	}
-
-	err = writeBackupFile(c)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func containerLoadById(d *Daemon, id int) (container, error) {
-	// Get the DB record
-	name, err := dbContainerName(d.db, id)
-	if err != nil {
-		return nil, err
-	}
-
-	return containerLoadByName(d, name)
-}
-
-func containerLoadByName(d *Daemon, name string) (container, error) {
-	// Get the DB record
-	args, err := dbContainerGet(d.db, name)
-	if err != nil {
-		return nil, err
-	}
-
-	return containerLXCLoad(d, args)
-}
